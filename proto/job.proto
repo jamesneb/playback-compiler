@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package job_proto;
+
+option go_package = "./;job_proto";
+
+
+message Job {
+  string id = 1;
+}
+
