@@ -1,4 +1,6 @@
-// tests/it_redis.rs
+//! Integration: Redis Streams
+//! Validates pop/ack and idle autoclaim with consumer groups using testcontainers.
+
 use bytes::Bytes;
 use deadpool_redis::redis;
 use testcontainers::core::WaitFor;

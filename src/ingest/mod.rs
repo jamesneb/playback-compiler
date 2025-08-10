@@ -1,3 +1,10 @@
+//! Ingest abstraction
+//!
+//! Overview
+//! --------
+//! Minimal trait representing a source of messages for the compiler. Concrete
+//! implementations include Redis Streams.
+
 use bytes::Bytes;
 
 #[derive(Debug, Clone)]

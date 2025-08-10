@@ -1,3 +1,18 @@
+//! Emit layer (replay sinks and keying)
+//!
+//! Overview
+//! --------
+//! Defines the sink abstraction for replay deltas and strategies to build
+//! storage keys. Concrete sinks (e.g., S3) live in submodules.
+//!
+//! Error Model
+//! -----------
+//! - `ReplaySink::Error` is sink-specific and mapped by callers.
+//!
+//! Concurrency / Performance
+//! -------------------------
+//! - Sinks are async. Implementations should avoid unnecessary copies.
+
 use crate::{errors::CompilerError, proto::Job};
 use bytes::Bytes;
 
@@ -5,6 +20,8 @@ pub mod dlq;
 pub mod uploader;
 
 use async_trait::async_trait;
+
+// ========= Traits =========
 
 #[async_trait]
 pub trait ReplaySink {
@@ -15,6 +32,8 @@ pub trait ReplaySink {
 pub trait DeltaKeyBuilder {
     fn replay_delta_key(&self, job: &Job, now_unix_secs: u64, now_nanos: u32) -> String;
 }
+
+// ========= Keying =========
 
 #[derive(Clone)]
 pub struct SimpleKeyBuilder {
@@ -37,6 +56,8 @@ impl DeltaKeyBuilder for SimpleKeyBuilder {
         )
     }
 }
+
+// ========= API =========
 
 pub async fn emit_replay_delta<S: ReplaySink + Sync>(
     sink: &S,

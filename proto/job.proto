@@ -1,3 +1,22 @@
+// job.proto — Inbound compiler job
+//
+// Overview
+// --------
+// Minimal envelope for compiler work items. This schema is intentionally small
+// and stable. Extend by adding new fields with *new* field numbers. Never
+// reuse or repurpose existing numbers.
+//
+// Compatibility Rules
+// -------------------
+// - Add only optional fields; avoid required fields.
+// - Do not change field types.
+// - Reserve removed field numbers and names.
+//
+// Versioning
+// -----------
+// - Coordinate changes with consumers and emitters.
+// - Keep changelog entries describing new fields and expected behavior.
+
 syntax = "proto3";
 
 package job_proto;

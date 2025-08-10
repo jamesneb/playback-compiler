@@ -1,4 +1,6 @@
-// tests/redis_parse.rs
+//! Unit: Redis reply parsing
+//! Validates parsing of XREADGROUP/XAUTOCLAIM reply shapes into QueueMessage.
+
 use bytes::Bytes;
 use deadpool_redis::redis::Value; // <-- use this
 use playback_compiler::redis::parse_xread_value;

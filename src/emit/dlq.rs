@@ -1,3 +1,10 @@
+//! Dead-letter publishing (Redis Streams)
+//!
+//! Overview
+//! --------
+//! Publishes failure events to a configured Redis stream for out-of-band
+//! inspection. Fields: reason, payload, optional job_id.
+
 use crate::errors::CompilerError;
 use bytes::Bytes;
 use deadpool_redis::{redis::cmd, Pool};

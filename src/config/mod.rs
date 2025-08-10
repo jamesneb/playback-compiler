@@ -1,3 +1,9 @@
+//! Configuration
+//!
+//! Overview
+//! --------
+//! Loads process configuration from environment (with dotenv support).
+
 use dotenvy::dotenv;
 use serde::Deserialize;
 use std::env;

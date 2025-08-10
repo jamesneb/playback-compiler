@@ -1,3 +1,6 @@
+//! Bench: Arrow encode
+//! Measures encode latency across varying id lengths for replay deltas.
+
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use playback_compiler::proto::Job;
 use playback_compiler::transform::encode::encode_replay_delta_arrow;

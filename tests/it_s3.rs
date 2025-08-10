@@ -1,4 +1,6 @@
-// tests/it_s3.rs
+//! Integration: S3-compatible sink (S3Mock)
+//! Validates deterministic PUT/GET round-trip for replay delta bytes.
+
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;

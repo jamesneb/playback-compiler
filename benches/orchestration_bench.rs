@@ -1,3 +1,6 @@
+//! Bench: emit path (sink)
+//! Measures sink call overhead with a no-op counting sink under a Tokio runtime.
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

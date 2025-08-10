@@ -1,3 +1,11 @@
+//! S3 client utilities
+//!
+//! Overview
+//! --------
+//! Constructs an AWS S3 client from environment (optionally pointing to local
+//! stacks) and provides simple upload helpers. Higher-level Arrow encoding lives
+//! in the transform layer.
+
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;

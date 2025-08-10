@@ -1,3 +1,6 @@
+//! Unit: Arrow encode/round-trip
+//! Verifies that encoded deltas can be read back and contain the expected ids.
+
 use arrow::array::Array;
 use arrow::array::StringArray;
 use arrow::ipc::reader::FileReader;

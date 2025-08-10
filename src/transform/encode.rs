@@ -1,3 +1,16 @@
+//! Replay delta encoding (Arrow IPC)
+//!
+//! Overview
+//! --------
+//! Encodes replay delta records into Arrow IPC format using a stable schema.
+//! The first column is a non-null Utf8 `id`. New fields should be appended as
+//! nullable columns to preserve forward/backward compatibility.
+//!
+//! Compatibility
+//! -------------
+//! - Use FileWriter for self-contained files (replay deltas stored in object storage).
+//! - StreamWriter can be introduced for continuous pipelines if needed.
+
 use crate::{errors::CompilerError, proto::Job};
 use arrow::{
     array::{ArrayRef, StringArray},

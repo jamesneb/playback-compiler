@@ -1,3 +1,26 @@
+//! Redis Streams integration
+//!
+//! Overview
+//! --------
+//! Provides a queue backed by Redis Streams (XREADGROUP / XACK) with consumer
+//! groups and idle-claim support for failover.
+//!
+//! Responsibilities
+//! ----------------
+//! - Pool initialization and accessors.
+//! - Stream group bootstrap.
+//! - Pop (bounded block), ack, and idle autoclaim.
+//!
+//! Error Model
+//! -----------
+//! - Pool/command errors map to `CompilerError`.
+//! - Unexpected reply shapes are treated as empty results.
+//!
+//! Concurrency / Performance
+//! -------------------------
+//! - Uses `deadpool-redis` for connection pooling.
+//! - Bounded block reads (configurable) to avoid indefinite hangs.
+
 use bytes::Bytes;
 use deadpool_redis::{redis, Config, Pool, Runtime};
 use once_cell::sync::OnceCell;
@@ -6,6 +29,9 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::CompilerError;
 use crate::ingest::{Queue, QueueMessage};
+
+// ========= Pool =========
+
 static REDIS_POOL: OnceCell<Pool> = OnceCell::new();
 
 pub async fn init_redis_pool(redis_url: &str) -> Result<(), CompilerError> {
@@ -23,6 +49,8 @@ pub fn pool() -> &'static Pool {
     REDIS_POOL.get().expect("Redis pool not initialized")
 }
 
+// ========= Types =========
+
 #[derive(Clone)]
 pub struct RedisStreamQueue {
     stream: String,
@@ -32,6 +60,8 @@ pub struct RedisStreamQueue {
     block_ms: usize,
     count: usize,
 }
+
+// ========= Public API =========
 
 impl RedisStreamQueue {
     pub fn new(
@@ -60,6 +90,8 @@ impl RedisStreamQueue {
         self
     }
 
+    /// Ensure the stream and group exist (idempotent)
+
     #[instrument(skip(self))]
     pub async fn ensure_stream_group(&self) -> Result<(), CompilerError> {
         let mut conn = self
@@ -67,7 +99,7 @@ impl RedisStreamQueue {
             .get()
             .await
             .map_err(|e| CompilerError::RedisInit(e.to_string()))?;
-
+        // Create group at '$' and stream if necessary. Ignore BUSYGROUP.
         let res: redis::RedisResult<()> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(&self.stream)
@@ -122,6 +154,7 @@ impl RedisStreamQueue {
         Ok(parse_xread_value(val))
     }
 
+    /// Claim messages idle longer than `idle_over` for this consumer.
     pub async fn autoclaim_idle_over(
         &self,
         min_idle: Duration,
@@ -149,6 +182,9 @@ impl RedisStreamQueue {
     }
 }
 
+// ========= Internals =========
+
+/// Parse the first item from an XREADGROUP reply.
 pub fn parse_xread_value(val: deadpool_redis::redis::Value) -> Option<QueueMessage> {
     use deadpool_redis::redis::Value;
     let mut msg_id: Option<String> = None;
@@ -191,7 +227,7 @@ pub fn parse_xread_value(val: deadpool_redis::redis::Value) -> Option<QueueMessa
     })
 }
 
-/// Parse XAUTOCLAIM reply → many QueueMessage.
+/// Parse XAUTOCLAIM (cursor, messages) reply into message records.
 fn parse_xautoclaim_value(val: redis::Value) -> Vec<QueueMessage> {
     use redis::Value;
     let mut out = Vec::new();
@@ -242,7 +278,7 @@ fn parse_xautoclaim_value(val: redis::Value) -> Vec<QueueMessage> {
 #[async_trait::async_trait]
 impl Queue for RedisStreamQueue {
     type Error = CompilerError;
-
+    /// Pop one message using XREADGROUP with a bounded block.
     async fn pop(&self) -> Result<Option<QueueMessage>, Self::Error> {
         // Try to ensure group; if it races with another worker, we’ll recover below.
         if let Err(e) = self.ensure_stream_group().await {
@@ -269,6 +305,7 @@ impl Queue for RedisStreamQueue {
         }
     }
 
+    /// Acknowledge a processed message id.
     async fn ack(&self, id: &str) -> Result<(), Self::Error> {
         let mut conn = self
             .pool

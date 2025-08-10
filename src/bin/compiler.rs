@@ -1,3 +1,27 @@
+//! playback-compiler: worker entrypoint
+//!
+//! Overview
+//! --------
+//! Orchestrates the compiler worker: connects to Redis Streams, receives jobs,
+//! decodes them, emits replay deltas to the storage sink, and acknowledges
+//! successfully processed messages. Failures are logged and can be routed to a
+//! dead-letter stream by the caller if desired.
+//!
+//! Responsibilities
+//! ----------------
+//! - Initialize logging, configuration, Redis pool, and S3 client.
+//! - Drive the receive → process → ack loop with graceful shutdown.
+//!
+//! Error Model
+//! -----------
+//! - Initialization failures are fatal.
+//! - Per-message failures are logged and do not terminate the loop.
+//!
+//! Concurrency / Performance
+//! -------------------------
+//! - Single async loop; Redis Stream consumer groups provide backpressure.
+//! - S3 uploads are awaited; batching can be introduced within the sink layer.
+
 use deadpool_redis::Pool;
 use playback_compiler::config::load_config;
 use playback_compiler::errors::CompilerError;
@@ -17,6 +41,8 @@ use tracing::{error, info, instrument};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+// ========= Logging =========
+
 pub fn init_logging() {
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())
@@ -24,6 +50,8 @@ pub fn init_logging() {
         .with(ErrorLayer::default())
         .init();
 }
+
+// ========= Main =========
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+// ========= Loop =========
 
 #[instrument(skip(queue, pool, sink, key_builder))]
 async fn run(
