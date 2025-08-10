@@ -9,6 +9,7 @@ pub struct Config {
     pub file_out_path: String,
     pub s3_bucket_name: String,
     pub s3_key: String,
+    pub idempotency_ttl_secs: usize,
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -18,11 +19,16 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let file_out_path = env::var("FILE_OUT_PATH")?;
     let s3_bucket_name = env::var("S3_BUCKET_NAME")?;
     let s3_key = env::var("S3_KEY")?;
+    let idempotency_ttl_secs = env::var("IDEMPOTENCY_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(86_400);
     Ok(Config {
         redis_url,
         job_queue_name,
         file_out_path,
         s3_bucket_name,
         s3_key,
+        idempotency_ttl_secs,
     })
 }

@@ -1,67 +1,54 @@
-use arrow::array::{Array, ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::FileWriter;
-use arrow::ipc::reader::FileReader;
-use arrow::record_batch::RecordBatch;
-use std::io::Cursor;
-use std::sync::Arc;
+use crate::{errors::CompilerError, proto::Job};
+use bytes::Bytes;
 
+pub mod dlq;
 pub mod uploader;
 
-pub fn write_to_arrow(id: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-    let id_array = Arc::new(StringArray::from(vec![id])) as ArrayRef;
-    let batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
+use async_trait::async_trait;
 
-    // Write to in-memory buffer instead of file
-    let mut buffer = Vec::new();
-    let cursor = Cursor::new(&mut buffer);
-    let mut writer = FileWriter::try_new(cursor, &schema)?;
-    writer.write(&batch)?;
-    writer.finish()?;
-
-    Ok(buffer)
+#[async_trait]
+pub trait ReplaySink {
+    type Error;
+    async fn put_delta(&self, key: &str, bytes: Bytes) -> Result<(), Self::Error>;
 }
 
-pub fn append_to_arrow(new_id: &str, existing_data: Option<&[u8]>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-    
-    let mut all_ids = Vec::new();
-    
-    // If we have existing data, read the existing IDs first
-    if let Some(data) = existing_data {
-        let cursor = Cursor::new(data);
-        match FileReader::try_new(cursor, None) {
-            Ok(reader) => {
-                for batch_result in reader {
-                    if let Ok(batch) = batch_result {
-                        if let Some(id_column) = batch.column(0).as_any().downcast_ref::<StringArray>() {
-                            for i in 0..id_column.len() {
-                                let existing_id = id_column.value(i);
-                                all_ids.push(existing_id.to_string());
-                            }
-                        }
-                    }
-                }
-            },
-            Err(_) => {
-                // If we can't read existing data, just start fresh
-            }
+pub trait DeltaKeyBuilder {
+    fn replay_delta_key(&self, job: &Job, now_unix_secs: u64, now_nanos: u32) -> String;
+}
+
+#[derive(Clone)]
+pub struct SimpleKeyBuilder {
+    pub prefix: String,
+}
+
+impl SimpleKeyBuilder {
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
         }
     }
-    
-    // Add the new ID
-    all_ids.push(new_id.to_string());
-    
-    // Create new Arrow file with all IDs
-    let id_array = Arc::new(StringArray::from(all_ids)) as ArrayRef;
-    let batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
+}
 
-    let mut buffer = Vec::new();
-    let cursor = Cursor::new(&mut buffer);
-    let mut writer = FileWriter::try_new(cursor, &schema)?;
-    writer.write(&batch)?;
-    writer.finish()?;
+impl DeltaKeyBuilder for SimpleKeyBuilder {
+    fn replay_delta_key(&self, job: &Job, s: u64, n: u32) -> String {
+        format!(
+            "{}/replay-deltas/{}/{}-{:09}.arrow",
+            self.prefix, job.id, s, n
+        )
+    }
+}
 
-    Ok(buffer)
+pub async fn emit_replay_delta<S: ReplaySink + Sync>(
+    sink: &S,
+    key_builder: &impl DeltaKeyBuilder,
+    job: &Job,
+    bytes: Bytes,
+) -> Result<(), CompilerError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let key = key_builder.replay_delta_key(job, now.as_secs(), now.subsec_nanos());
+    sink.put_delta(&key, bytes)
+        .await
+        .map_err(|_| CompilerError::JobProcessingError("replay sink put failed".into()))
 }

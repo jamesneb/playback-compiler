@@ -14,6 +14,9 @@ pub enum CompilerError {
     #[error("Job processing error: {0}")]
     JobProcessingError(String),
 
+    #[error("Queue message decode error: {0}")]
+    Decode(String),
+
     #[error("Unknown error: {0}")]
     Unknown(#[from] Box<dyn std::error::Error + Send + Sync>),
 }

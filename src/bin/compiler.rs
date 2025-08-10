@@ -1,82 +1,110 @@
-use aws_sdk_s3::Client;
-use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
 use playback_compiler::config::load_config;
-use playback_compiler::emit::uploader::{create_s3_client_from_env, append_to_s3_arrow, upload_to_s3};
-use playback_compiler::emit::write_to_arrow;
 use playback_compiler::errors::CompilerError;
-use playback_compiler::redis::get_pool;
-use playback_compiler::redis::init_redis_pool;
-use prost::Message;
+use playback_compiler::ingest::Queue;
+use playback_compiler::redis::{init_redis_pool, pool as redis_pool, RedisStreamQueue};
+
+use playback_compiler::emit::uploader::{create_s3_client_from_env, S3ReplaySink};
+use playback_compiler::emit::{emit_replay_delta, SimpleKeyBuilder};
+
+use playback_compiler::transform::decode::decode_job;
+use playback_compiler::transform::encode::encode_replay_delta_arrow;
+
+use playback_compiler::types::fp::{idempotency_claim, idempotency_release, publish_dlq, Idem};
+
 use tokio::signal;
+use tracing::{error, info, instrument};
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub mod proto {
-    include!("../proto/job_proto.rs");
+pub fn init_logging() {
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(fmt::layer().compact())
+        .with(ErrorLayer::default())
+        .init();
 }
-
-use proto::Job;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Compiler starting...");
+    init_logging();
+    info!("compiler starting");
+    let cfg = load_config()?;
+    init_redis_pool(&cfg.redis_url).await?;
 
-    let config = load_config().expect("Failed to load config");
-    init_redis_pool(&config.redis_url)
-        .await
-        .map_err(|e| CompilerError::RedisInit(e.to_string()))?;
-
-    let pool = get_pool();
-    let store = create_s3_client_from_env().await;
-    tokio::select! {
-        _ = run_compiler_loop(pool, store, &config) => {},
-        _ = signal::ctrl_c() => {
-            println!("Received Ctrl+C, shutting down.");
-        },
-    }
-
-    Ok(())
-}
-async fn run_compiler_loop(pool: &Pool, store: Client, cfg: &playback_compiler::config::Config) {
-    let mut conn = match pool.get().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("Failed to get Redis connection: {}", err);
-            return;
-        }
+    let pool: Pool = redis_pool().clone();
+    let queue = {
+        let stream = cfg.job_queue_name.clone();
+        let group = "compilers".to_string();
+        let consumer = format!("compiler-{}", std::process::id());
+        RedisStreamQueue::new(pool.clone(), stream, group, consumer)
     };
 
-    let queue_name = &cfg.job_queue_name;
-    let bucket = &cfg.s3_bucket_name;
-    let key = &cfg.s3_key;
+    let s3 = create_s3_client_from_env().await;
+    let sink = S3ReplaySink::new(s3, cfg.s3_bucket_name.clone());
+    let key_builder = SimpleKeyBuilder::new(&cfg.s3_key);
+    let dlq_stream = format!("{}:dlq", cfg.job_queue_name);
+    let ttl = cfg.idempotency_ttl_secs;
 
+    tokio::select! {
+        res = run(queue, pool.clone(), sink, key_builder, dlq_stream, ttl) => { if let Err(e) = res { error!(err=%e, "compiler loop error"); } }
+        _ = signal::ctrl_c() => { info!("ctrl+c received, shutting down"); }
+    }
+    Ok(())
+}
+
+#[instrument(skip(queue, pool, sink, key_builder))]
+async fn run(
+    queue: RedisStreamQueue,
+    pool: Pool,
+    sink: S3ReplaySink,
+    key_builder: SimpleKeyBuilder,
+    dlq_stream: String,
+    ttl: usize,
+) -> Result<(), CompilerError> {
+    queue.ensure_stream_group().await?;
     loop {
-        println!("Waiting for job...");
+        let Some(msg) = queue.pop().await? else { continue };
 
-        let result: Option<(String, Vec<u8>)> = match conn.blpop(queue_name, 0.0).await {
-            Ok(job) => job,
-            Err(err) => {
-                eprintln!("Redis error: {}", err);
+        let job = match decode_job(&msg.payload) {
+            Ok(j) => j,
+            Err(_) => {
+                publish_dlq(&pool, &dlq_stream, "decode_error", None, &msg.payload).await?;
+                queue.ack(&msg.id).await?;
                 continue;
             }
         };
 
-        if let Some((_key, bytes)) = result {
-            match Job::decode(&*bytes) {
-                Ok(job) => {
-                    match append_to_s3_arrow(&store, bucket, key, &job.id).await {
-                        Ok(_) => {
-                            println!("Successfully appended job ID '{}' to arrow file: s3://{}/{}", job.id, bucket, key);
-                        },
-                        Err(e) => {
-                            eprintln!("Failed to append job to S3: {}", e);
-                            eprintln!("Append failed for job ID: {}", job.id);
-                            eprintln!("Target bucket: {}, key: {}", bucket, key);
-                        }
+        match idempotency_claim(&pool, &job.id, ttl).await? {
+            Idem::Duplicate => {
+                queue.ack(&msg.id).await?;
+                continue;
+            }
+            Idem::Fresh(key) => {
+                let result = (|| async {
+                    let bytes = encode_replay_delta_arrow(&job)?;
+                    emit_replay_delta(&sink, &key_builder, &job, bytes).await
+                })()
+                .await;
+
+                match result {
+                    Ok(_) => {
+                        queue.ack(&msg.id).await?;
+                    }
+                    Err(e) => {
+                        idempotency_release(&pool, key).await;
+                        publish_dlq(
+                            &pool,
+                            &dlq_stream,
+                            "process_error",
+                            Some(&job.id),
+                            &msg.payload,
+                        )
+                        .await?;
+                        return Err(e);
                     }
                 }
-                Err(err) => eprintln!("Failed to decode protobuf: {}", err),
             }
         }
     }
 }
-
