@@ -1,0 +1,40 @@
+// tests/redis_parse.rs
+use bytes::Bytes;
+use deadpool_redis::redis::Value; // <-- use this
+use playback_compiler::redis::parse_xread_value;
+
+#[test]
+fn parse_minimal_xread_reply() {
+    let reply = Value::Bulk(vec![Value::Bulk(vec![
+        Value::Data(b"jobs".to_vec()),
+        Value::Bulk(vec![Value::Bulk(vec![
+            Value::Data(b"1-0".to_vec()),
+            Value::Bulk(vec![
+                Value::Data(b"payload".to_vec()),
+                Value::Data(b"\x08\x01".to_vec()),
+            ]),
+        ])]),
+    ])]);
+
+    let msg = parse_xread_value(reply).expect("parsed");
+    assert_eq!(msg.id, "1-0");
+    assert_eq!(msg.payload, Bytes::from_static(b"\x08\x01"));
+}
+
+#[test]
+fn parse_ignores_missing_payload() {
+    let reply = Value::Bulk(vec![Value::Bulk(vec![
+        Value::Data(b"jobs".to_vec()),
+        Value::Bulk(vec![Value::Bulk(vec![
+            Value::Data(b"2-0".to_vec()),
+            Value::Bulk(vec![Value::Data(b"k".to_vec()), Value::Data(b"v".to_vec())]),
+        ])]),
+    ])]);
+    assert!(parse_xread_value(reply).is_none());
+}
+
+#[test]
+fn parse_handles_empty_reply() {
+    assert!(parse_xread_value(Value::Nil).is_none());
+    assert!(parse_xread_value(Value::Bulk(vec![])).is_none());
+}

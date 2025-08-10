@@ -1,0 +1,33 @@
+name: Nightly Integration
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 9:00 UTC daily (adjust as you like)
+  workflow_dispatch: {}
+
+jobs:
+  integrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Docker is enabled by default on ubuntu-latest; testcontainers will manage containers.
+
+      - name: Run ignored integration tests (nextest)
+        env:
+          RUST_LOG: info
+        run: |
+          cargo nextest run \
+            --profile nightly \
+            --all-features \
+            --run-ignored=ignored-only

@@ -1,13 +1,11 @@
 use bytes::Bytes;
-use deadpool_redis::redis::{self};
-use deadpool_redis::{Config, Pool, Runtime};
+use deadpool_redis::{redis, Config, Pool, Runtime};
 use once_cell::sync::OnceCell;
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::CompilerError;
 use crate::ingest::{Queue, QueueMessage};
-
 static REDIS_POOL: OnceCell<Pool> = OnceCell::new();
 
 pub async fn init_redis_pool(redis_url: &str) -> Result<(), CompilerError> {
@@ -121,51 +119,7 @@ impl RedisStreamQueue {
             .map_err(|e| CompilerError::RedisPoolError(e.to_string()))?;
 
         let Some(val) = reply else { return Ok(None) };
-
-        let mut msg_id: Option<String> = None;
-        let mut payload: Option<Vec<u8>> = None;
-
-        if let redis::Value::Bulk(streams) = val {
-            if let Some(redis::Value::Bulk(stream_entry)) = streams.get(0) {
-                if let Some(redis::Value::Bulk(entries)) = stream_entry.get(1) {
-                    if let Some(redis::Value::Bulk(entry)) = entries.get(0) {
-                        if let Some(redis::Value::Data(idb)) = entry.get(0) {
-                            msg_id = Some(String::from_utf8_lossy(idb).to_string());
-                        }
-                        if let Some(redis::Value::Bulk(kvs)) = entry.get(1) {
-                            let mut i = 0;
-                            while i + 1 < kvs.len() {
-                                let k = &kvs[i];
-                                let v = &kvs[i + 1];
-                                let k_str = match k {
-                                    redis::Value::Data(b) => String::from_utf8_lossy(b),
-                                    _ => "".into(),
-                                };
-                                if k_str == "payload" {
-                                    if let redis::Value::Data(b) = v {
-                                        payload = Some(b.clone());
-                                    }
-                                }
-                                i += 2;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let id = match msg_id {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let bytes = match payload {
-            Some(b) => b,
-            None => return Err(CompilerError::Decode("missing payload".into())),
-        };
-        Ok(Some(QueueMessage {
-            id,
-            payload: Bytes::from(bytes),
-        }))
+        Ok(parse_xread_value(val))
     }
 
     pub async fn autoclaim_idle_over(
@@ -191,47 +145,98 @@ impl RedisStreamQueue {
             .await
             .map_err(|e| CompilerError::RedisPoolError(e.to_string()))?;
 
-        let mut out = Vec::new();
-        if let redis::Value::Bulk(outer) = res {
-            if outer.len() >= 2 {
-                if let redis::Value::Bulk(entries) = &outer[1] {
-                    for e in entries {
-                        if let redis::Value::Bulk(parts) = e {
-                            let id = match &parts[0] {
-                                redis::Value::Data(b) => String::from_utf8_lossy(b).to_string(),
-                                _ => continue,
+        Ok(parse_xautoclaim_value(res))
+    }
+}
+
+pub fn parse_xread_value(val: deadpool_redis::redis::Value) -> Option<QueueMessage> {
+    use deadpool_redis::redis::Value;
+    let mut msg_id: Option<String> = None;
+    let mut payload: Option<Vec<u8>> = None;
+
+    if let Value::Bulk(streams) = val {
+        if let Some(Value::Bulk(stream_entry)) = streams.get(0) {
+            if let Some(Value::Bulk(entries)) = stream_entry.get(1) {
+                if let Some(Value::Bulk(entry)) = entries.get(0) {
+                    if let Some(Value::Data(idb)) = entry.get(0) {
+                        msg_id = Some(String::from_utf8_lossy(idb).to_string());
+                    }
+                    if let Some(Value::Bulk(kvs)) = entry.get(1) {
+                        let mut i = 0;
+                        while i + 1 < kvs.len() {
+                            let k = &kvs[i];
+                            let v = &kvs[i + 1];
+                            let k_str = match k {
+                                Value::Data(b) => String::from_utf8_lossy(b),
+                                _ => "".into(),
                             };
-                            let mut payload: Option<Vec<u8>> = None;
-                            if let redis::Value::Bulk(kvs) = &parts[1] {
-                                let mut i = 0;
-                                while i + 1 < kvs.len() {
-                                    let k = &kvs[i];
-                                    let v = &kvs[i + 1];
-                                    let k_str = match k {
-                                        redis::Value::Data(b) => String::from_utf8_lossy(b),
-                                        _ => "".into(),
-                                    };
-                                    if k_str == "payload" {
-                                        if let redis::Value::Data(b) = v {
-                                            payload = Some(b.clone());
-                                        }
-                                    }
-                                    i += 2;
+                            if k_str == "payload" {
+                                if let Value::Data(b) = v {
+                                    payload = Some(b.clone());
                                 }
                             }
-                            if let Some(p) = payload {
-                                out.push(QueueMessage {
-                                    id,
-                                    payload: Bytes::from(p),
-                                });
-                            }
+                            i += 2;
                         }
                     }
                 }
             }
         }
-        Ok(out)
     }
+
+    let id = msg_id?;
+    let bytes = payload?;
+    Some(QueueMessage {
+        id,
+        payload: Bytes::from(bytes),
+    })
+}
+
+/// Parse XAUTOCLAIM reply → many QueueMessage.
+fn parse_xautoclaim_value(val: redis::Value) -> Vec<QueueMessage> {
+    use redis::Value;
+    let mut out = Vec::new();
+
+    if let Value::Bulk(outer) = val {
+        // Shape: [ <next-id>, [ [id, [kvs...]], ... ] , ... ]
+        if outer.len() >= 2 {
+            if let Value::Bulk(entries) = &outer[1] {
+                for e in entries {
+                    if let Value::Bulk(parts) = e {
+                        let id = match &parts[0] {
+                            Value::Data(b) => String::from_utf8_lossy(b).to_string(),
+                            _ => continue,
+                        };
+                        let mut payload: Option<Vec<u8>> = None;
+                        if let Value::Bulk(kvs) = &parts[1] {
+                            let mut i = 0;
+                            while i + 1 < kvs.len() {
+                                let k = &kvs[i];
+                                let v = &kvs[i + 1];
+                                let k_str = match k {
+                                    Value::Data(b) => String::from_utf8_lossy(b),
+                                    _ => "".into(),
+                                };
+                                if k_str == "payload" {
+                                    if let Value::Data(b) = v {
+                                        payload = Some(b.clone());
+                                    }
+                                }
+                                i += 2;
+                            }
+                        }
+                        if let Some(p) = payload {
+                            out.push(QueueMessage {
+                                id,
+                                payload: Bytes::from(p),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 #[async_trait::async_trait]
@@ -239,10 +244,12 @@ impl Queue for RedisStreamQueue {
     type Error = CompilerError;
 
     async fn pop(&self) -> Result<Option<QueueMessage>, Self::Error> {
+        // Try to ensure group; if it races with another worker, we’ll recover below.
         if let Err(e) = self.ensure_stream_group().await {
             warn!(err=%e, "ensure_stream_group failed; will retry");
         }
 
+        // Simple exponential backoff on transport errors.
         let mut backoff = Duration::from_millis(200);
         loop {
             match self.pop_once().await {

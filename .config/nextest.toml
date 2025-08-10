@@ -1,0 +1,13 @@
+[profile.default]
+retries = 0
+status-level = "pass"
+
+[profile.ci]
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Mark ignored tests as skipped by default; nightly job will run them.
+[profile.nightly]
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 2 }
+
