@@ -11,28 +11,30 @@
 //! - Use FileWriter for self-contained files (replay deltas stored in object storage).
 //! - StreamWriter can be introduced for continuous pipelines if needed.
 
-use crate::{errors::CompilerError, proto::Job};
-use arrow::{
-    array::{ArrayRef, StringArray},
-    datatypes::{DataType, Field, Schema},
-    ipc::writer::FileWriter,
-    record_batch::RecordBatch,
-};
-use bytes::Bytes;
-use std::{io::Cursor, sync::Arc};
+use std::io::Cursor;
+use std::sync::Arc;
 
-pub fn encode_replay_delta_arrow(job: &Job) -> Result<Bytes, CompilerError> {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-    let id_col = Arc::new(StringArray::from(vec![job.id.clone()])) as ArrayRef;
-    let batch = RecordBatch::try_new(schema.clone(), vec![id_col])
-        .map_err(|e| CompilerError::JobProcessingError(e.to_string()))?;
-    let mut buf = Vec::new();
-    let cur = Cursor::new(&mut buf);
-    let mut w = FileWriter::try_new(cur, &schema)
-        .map_err(|e| CompilerError::JobProcessingError(e.to_string()))?;
-    w.write(&batch)
-        .map_err(|e| CompilerError::JobProcessingError(e.to_string()))?;
-    w.finish()
-        .map_err(|e| CompilerError::JobProcessingError(e.to_string()))?;
-    Ok(Bytes::from(buf))
+use arrow::array::{ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::FileWriter;
+use arrow::record_batch::RecordBatch;
+use once_cell::sync::Lazy;
+
+use crate::proto::Job;
+
+// Static schema to avoid re-allocating per message.
+static SCHEMA: Lazy<Arc<Schema>> =
+    Lazy::new(|| Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])));
+
+pub fn encode_replay_delta_arrow(job: &Job) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let id_array = Arc::new(StringArray::from(vec![job.id.clone()])) as ArrayRef;
+    let batch = RecordBatch::try_new(SCHEMA.clone(), vec![id_array])?;
+
+    let mut buffer = Vec::new();
+    let cursor = Cursor::new(&mut buffer);
+    let mut writer = FileWriter::try_new(cursor, &SCHEMA)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+
+    Ok(buffer)
 }

@@ -9,6 +9,7 @@ name = "playback_compiler"
 path = "src/lib.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 prost = "0.14.1"
 prost-types = "0.14.1"
 bytes = "1"

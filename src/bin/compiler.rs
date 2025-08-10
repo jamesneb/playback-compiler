@@ -22,26 +22,31 @@
 //! - Single async loop; Redis Stream consumer groups provide backpressure.
 //! - S3 uploads are awaited; batching can be introduced within the sink layer.
 
-use deadpool_redis::Pool;
-use playback_compiler::config::load_config;
-use playback_compiler::errors::CompilerError;
-use playback_compiler::ingest::Queue;
-use playback_compiler::redis::{init_redis_pool, pool as redis_pool, RedisStreamQueue};
+//! playback-compiler: worker entrypoint (batched, concurrency-limited)
 
-use playback_compiler::emit::uploader::{create_s3_client_from_env, S3ReplaySink};
-use playback_compiler::emit::{emit_replay_delta, SimpleKeyBuilder};
+//! playback-compiler: worker entrypoint (batched, concurrency-limited)
 
-use playback_compiler::transform::decode::decode_job;
-use playback_compiler::transform::encode::encode_replay_delta_arrow;
+//! playback-compiler: worker entrypoint (batched, concurrency-limited)
 
-use playback_compiler::types::fp::{idempotency_claim, idempotency_release, publish_dlq, Idem};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::Client;
 use tokio::signal;
-use tracing::{error, info, instrument};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::{error, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-// ========= Logging =========
+use playback_compiler::config::load_config;
+use playback_compiler::emit::uploader::{create_s3_client_from_env, upload_to_s3};
+use playback_compiler::emit::{DeltaKeyBuilder, SimpleKeyBuilder};
+use playback_compiler::errors::CompilerError;
+use playback_compiler::proto::Job;
+use playback_compiler::redis::{init_redis_pool, pool, RedisStreamQueue};
+use playback_compiler::transform::decode::decode_job;
+use playback_compiler::transform::encode::encode_replay_delta_arrow;
 
 pub fn init_logging() {
     tracing_subscriber::registry()
@@ -51,90 +56,106 @@ pub fn init_logging() {
         .init();
 }
 
-// ========= Main =========
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     info!("compiler starting");
-    let cfg = load_config()?;
-    init_redis_pool(&cfg.redis_url).await?;
 
-    let pool: Pool = redis_pool().clone();
-    let queue = {
-        let stream = cfg.job_queue_name.clone();
-        let group = "compilers".to_string();
-        let consumer = format!("compiler-{}", std::process::id());
-        RedisStreamQueue::new(pool.clone(), stream, group, consumer)
-    };
+    let config = load_config().expect("failed to load config");
+
+    init_redis_pool(&config.redis_url)
+        .await
+        .map_err(|e| CompilerError::RedisInit(e.to_string()))?;
 
     let s3 = create_s3_client_from_env().await;
-    let sink = S3ReplaySink::new(s3, cfg.s3_bucket_name.clone());
-    let key_builder = SimpleKeyBuilder::new(&cfg.s3_key);
-    let dlq_stream = format!("{}:dlq", cfg.job_queue_name);
-    let ttl = cfg.idempotency_ttl_secs;
+
+    let queue = RedisStreamQueue::new(pool().clone(), &config.job_queue_name, "compilers", "c1");
+    queue.ensure_stream_group().await?;
 
     tokio::select! {
-        res = run(queue, pool.clone(), sink, key_builder, dlq_stream, ttl) => { if let Err(e) = res { error!(err=%e, "compiler loop error"); } }
-        _ = signal::ctrl_c() => { info!("ctrl+c received, shutting down"); }
+        _ = run_loop(queue, s3, &config) => {},
+        _ = signal::ctrl_c() => {
+            info!("shutdown requested");
+        }
     }
+
     Ok(())
 }
 
-// ========= Loop =========
+async fn run_loop(queue: RedisStreamQueue, s3: Client, cfg: &playback_compiler::config::Config) {
+    let permits = std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8);
+    let semaphore = Arc::new(Semaphore::new(permits));
 
-#[instrument(skip(queue, pool, sink, key_builder))]
-async fn run(
-    queue: RedisStreamQueue,
-    pool: Pool,
-    sink: S3ReplaySink,
-    key_builder: SimpleKeyBuilder,
-    dlq_stream: String,
-    ttl: usize,
-) -> Result<(), CompilerError> {
-    queue.ensure_stream_group().await?;
+    const BATCH: usize = 256;
+    let key_builder = SimpleKeyBuilder::new("tenants/default");
+
     loop {
-        let Some(msg) = queue.pop().await? else { continue };
-
-        let job = match decode_job(&msg.payload) {
-            Ok(j) => j,
-            Err(_) => {
-                publish_dlq(&pool, &dlq_stream, "decode_error", None, &msg.payload).await?;
-                queue.ack(&msg.id).await?;
+        let batch = match queue.pop_batch(BATCH).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(err = %e, "batch pop failed");
                 continue;
             }
         };
 
-        match idempotency_claim(&pool, &job.id, ttl).await? {
-            Idem::Duplicate => {
-                queue.ack(&msg.id).await?;
-                continue;
-            }
-            Idem::Fresh(key) => {
-                let result = (|| async {
-                    let bytes = encode_replay_delta_arrow(&job)?;
-                    emit_replay_delta(&sink, &key_builder, &job, bytes).await
-                })()
-                .await;
+        if batch.is_empty() {
+            continue;
+        }
 
-                match result {
-                    Ok(_) => {
-                        queue.ack(&msg.id).await?;
-                    }
+        let mut join = JoinSet::new();
+        for msg in batch {
+            let s3 = s3.clone();
+            let bucket = cfg.s3_bucket_name.clone();
+            let kb = key_builder.clone();
+            let sem = semaphore.clone();
+
+            join.spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+
+                let job: Job = match decode_job(&msg.payload) {
+                    Ok(j) => j,
                     Err(e) => {
-                        idempotency_release(&pool, key).await;
-                        publish_dlq(
-                            &pool,
-                            &dlq_stream,
-                            "process_error",
-                            Some(&job.id),
-                            &msg.payload,
+                        return (
+                            msg.id,
+                            Err(CompilerError::JobProcessingError(format!("decode: {e}"))),
                         )
-                        .await?;
-                        return Err(e);
                     }
-                }
+                };
+
+                let arrow = match encode_replay_delta_arrow(&job) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            msg.id,
+                            Err(CompilerError::JobProcessingError(format!("encode: {e}"))),
+                        )
+                    }
+                };
+
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                let key = kb.replay_delta_key(&job, now.as_secs() as u64, now.subsec_nanos());
+
+                let res = upload_to_s3(&s3, &bucket, &key, arrow)
+                    .await
+                    .map_err(|e| CompilerError::JobProcessingError(format!("s3 put: {e}")));
+
+                (msg.id, res)
+            });
+        }
+
+        let mut success_ids: Vec<String> = Vec::new();
+        while let Some(res) = join.join_next().await {
+            match res {
+                Ok((id, Ok(()))) => success_ids.push(id),
+                Ok((id, Err(e))) => error!(id = %id, err = %e, "job failed"),
+                Err(e) => error!(err = %e, "task join error"),
             }
+        }
+
+        if let Err(e) = queue.ack_many(&success_ids).await {
+            error!(count = success_ids.len(), err = %e, "ack_many failed");
         }
     }
 }
