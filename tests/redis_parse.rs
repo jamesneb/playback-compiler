@@ -1,5 +1,4 @@
-//! Unit: Redis reply parsing
-//! Validates parsing of XREAD* reply shapes into QueueMessage.
+//! Unit tests for parsing `XREAD` responses into `QueueMessage` values.
 
 use bytes::Bytes;
 use deadpool_redis::redis::Value;

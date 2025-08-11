@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 
 fn rand_id(len: usize) -> String {
     rand::thread_rng()
@@ -15,10 +15,10 @@ fn bench_encode_many_ids(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_many_ids_arrow");
     for &n_ids in &[1usize, 8, 64, 512, 4096] {
         group.bench_with_input(BenchmarkId::from_parameter(n_ids), &n_ids, |b, &n| {
-            // Prepare a fixed input set per iteration size
+            // Generate input ids once per benchmark iteration size.
             let ids: Vec<Bytes> = (0..n)
                 .map(|i| {
-                    // vary length a little to avoid degenerate layouts
+                    // Vary lengths slightly to exercise different Arrow layouts.
                     let s = rand_id(8 + (i % 17));
                     Bytes::from(s)
                 })

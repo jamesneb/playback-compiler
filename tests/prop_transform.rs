@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use proptest::string::string_regex;
 use std::io::Cursor;
 
-// IDs: mix ASCII (no newlines) and general Unicode scalar values.
+// Generate identifiers with ASCII or general Unicode characters.
 fn any_id() -> impl Strategy<Value = String> {
     let ascii = string_regex(r"[^\n]{0,1024}").unwrap();
     let unicode = proptest::collection::vec(any::<char>(), 0..512)
@@ -17,10 +17,10 @@ fn any_id() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-  // encode → arrow → read back → contains id
+  // Encode identifiers to Arrow, read back, and verify the ID is present.
   #[test]
   fn arrow_roundtrips_id(id in any_id()) {
-      // (Job is not strictly needed, keep to mirror real usage)
+      // Job is constructed to mirror realistic usage even if unused.
       let _job = Job { id: id.clone() };
 
       let bytes = encode_many_ids_arrow_bytes(&[Bytes::from(id.clone())], false).expect("encode");
@@ -39,7 +39,7 @@ proptest! {
       prop_assert!(found);
   }
 
-  // Random bytes should fail to decode as a valid Job
+  // Random bytes should fail to decode as a valid Job.
   #[test]
   fn decode_rejects_random_bytes(buf in proptest::collection::vec(any::<u8>(), 0..4096)) {
       let payload = Bytes::from(buf);

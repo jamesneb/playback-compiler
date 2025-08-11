@@ -1,4 +1,4 @@
-//! Unit: Arrow encode/round-trip (BinaryArray)
+//! Unit test for Arrow encoding round-trips.
 use arrow::array::{Array, BinaryArray};
 use arrow::ipc::reader::FileReader;
 use bytes::Bytes;

@@ -1,6 +1,7 @@
-//! Arrow IPC encoding (IDs → Arrow file bytes)
-//! Note: Arrow 56 doesn't support setting IPC compression via
-//! `IpcWriteOptions` fields. We emit uncompressed IPC here.
+//! Convert identifier lists into Arrow IPC file bytes.
+//!
+//! Arrow 56 lacks IPC-level compression knobs, so the output is always
+//! uncompressed.
 
 use std::sync::Arc;
 
@@ -11,11 +12,11 @@ use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use bytes::Bytes;
 
 pub fn encode_many_ids_arrow_bytes(ids: &[Bytes], _use_zstd: bool) -> anyhow::Result<Vec<u8>> {
-    // Schema: one Binary column "id"
+    // Schema with a single binary `id` column.
     let field = Field::new("id", DataType::Binary, false);
     let schema = Arc::new(Schema::new(vec![field]));
 
-    // Build the Binary column
+    // Populate the column with provided identifiers.
     let mut builder = BinaryBuilder::new();
     for b in ids {
         builder.append_value(b);
@@ -23,7 +24,7 @@ pub fn encode_many_ids_arrow_bytes(ids: &[Bytes], _use_zstd: bool) -> anyhow::Re
     let array = Arc::new(builder.finish()) as ArrayRef;
     let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
 
-    // Serialize to IPC file
+    // Serialize to a binary IPC file.
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut cursor = std::io::Cursor::new(&mut buf);
 
@@ -35,5 +36,5 @@ pub fn encode_many_ids_arrow_bytes(ids: &[Bytes], _use_zstd: bool) -> anyhow::Re
     Ok(buf)
 }
 
-// Placeholder for future pooling if needed.
+// Reserved for future buffer pooling.
 pub fn return_encoded_buf_to_pool(_buf: Vec<u8>) {}

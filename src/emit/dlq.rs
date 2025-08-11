@@ -1,9 +1,7 @@
-//! Dead-letter publishing (Redis Streams)
+//! Publish failed processing events to a Redis-backed dead-letter stream.
 //!
-//! Overview
-//! --------
-//! Publishes failure events to a configured Redis stream for out-of-band
-//! inspection. Fields: reason, payload, optional job_id.
+//! Each entry includes a reason, the raw payload, and an optional job ID for
+//! later inspection.
 
 use crate::errors::CompilerError;
 use bytes::Bytes;
