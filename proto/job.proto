@@ -1,21 +1,5 @@
-// job.proto — Inbound compiler job
-//
-// Overview
-// --------
-// Minimal envelope for compiler work items. This schema is intentionally small
-// and stable. Extend by adding new fields with *new* field numbers. Never
-// reuse or repurpose existing numbers.
-//
-// Compatibility Rules
-// -------------------
-// - Add only optional fields; avoid required fields.
-// - Do not change field types.
-// - Reserve removed field numbers and names.
-//
-// Versioning
-// -----------
-// - Coordinate changes with consumers and emitters.
-// - Keep changelog entries describing new fields and expected behavior.
+// Schema defining the minimal job envelope consumed by the compiler.
+// New fields must use unique numbers and preserve backward compatibility.
 
 syntax = "proto3";
 
@@ -25,6 +9,6 @@ option go_package = "./;job_proto";
 
 
 message Job {
-  string id = 1;
+  string id = 1; // Unique identifier for the job.
 }
 

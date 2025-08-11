@@ -1,4 +1,4 @@
-//! Redis Streams integration (single version of `redis` via deadpool-redis)
+//! Redis Streams integration that leverages `deadpool-redis` for a single `redis` dependency.
 
 use crate::errors::CompilerError;
 use crate::ingest::Queue;
@@ -80,7 +80,7 @@ impl RedisStreamQueue {
             .await
             .map_err(|e| CompilerError::RedisInit(e.to_string()))?;
 
-        // Ask for a typed Value to avoid cross-crate type mismatch
+        // Request a concrete redis::Value to keep version differences isolated.
         let val: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(&self.group)
@@ -139,25 +139,31 @@ impl Queue for RedisStreamQueue {
     }
 }
 
-/// Parse the `XREADGROUP` redis::Value reply into QueueMessage list.
-/// We stay purely on the deadpool-redis `redis` crate to avoid type/version conflicts.
+/// Convert the `XREADGROUP` response into a list of `QueueMessage` instances.
+/// Uses the `redis` crate types exclusively to sidestep version mismatches.
 pub fn parse_xread_value(val: redis::Value) -> Vec<QueueMessage> {
     use deadpool_redis::redis::Value;
     let mut out = Vec::new();
 
-    // Expected shape:
+    // Response layout:
     // Array[
     //   Array[ stream_name, Array[ Array[ id, Array[ k1, v1, ... ] ], ... ] ],
     //   ...
     // ]
-    let Value::Bulk(streams) = val else { return out };
+    let Value::Bulk(streams) = val else {
+        return out;
+    };
 
     for s in streams {
-        let Value::Bulk(stream_pair) = s else { continue };
+        let Value::Bulk(stream_pair) = s else {
+            continue;
+        };
         if stream_pair.len() != 2 {
             continue;
         }
-        let Value::Bulk(msgs) = &stream_pair[1] else { continue };
+        let Value::Bulk(msgs) = &stream_pair[1] else {
+            continue;
+        };
 
         for m in msgs {
             let Value::Bulk(pair) = m else { continue };

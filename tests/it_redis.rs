@@ -1,12 +1,12 @@
-//! Integration: Redis Streams
+//! Integration test exercising Redis Streams ingestion.
 
 use bytes::Bytes;
 use deadpool_redis::redis;
 use testcontainers::core::WaitFor;
-use testcontainers::{clients, GenericImage};
+use testcontainers::{GenericImage, clients};
 
 use playback_compiler::ingest::Queue;
-use playback_compiler::redis::{init_redis_pool, pool, RedisStreamQueue};
+use playback_compiler::redis::{RedisStreamQueue, init_redis_pool, pool};
 
 #[tokio::test]
 async fn redis_streams_end_to_end() {
@@ -19,7 +19,7 @@ async fn redis_streams_end_to_end() {
 
     init_redis_pool(&url).await.unwrap();
 
-    // pop/ack
+    // Pop a message and acknowledge it.
     let q = RedisStreamQueue::new(pool().clone(), "jobs", "compilers", "c1");
     q.ensure_stream_group().await.unwrap();
 

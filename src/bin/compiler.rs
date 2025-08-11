@@ -1,14 +1,14 @@
-// src/bin/compiler.rs
+//! Command-line entry point for the compiler service.
 
 use bytes::Bytes;
 use playback_compiler::config::load_config;
 use playback_compiler::emit::uploader::{create_s3_client_from_env, upload_bytes_to_s3};
 use playback_compiler::ingest::Queue;
 use playback_compiler::proto::Job;
-use playback_compiler::redis::{init_redis_pool, pool, RedisStreamQueue};
+use playback_compiler::redis::{RedisStreamQueue, init_redis_pool, pool};
 use playback_compiler::transform::decode::decode_job;
 use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
-use playback_compiler::types::fp::{idempotency_claim, idempotency_release, publish_dlq, Idem};
+use playback_compiler::types::fp::{Idem, idempotency_claim, idempotency_release, publish_dlq};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    Ok(None) => { /* timed out; loop again */ }
+                    Ok(None) => { /* No message available; poll again */ }
                     Err(e) => {
                         error!(error=?e, "pop failed");
                         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -90,7 +90,7 @@ async fn handle_one(
     s3: &aws_sdk_s3::Client,
     cfg: &playback_compiler::config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // decode protobuf
+    // Decode the inbound job payload.
     let raw_b = Bytes::from(raw);
     let job: Job = match decode_job(&raw_b) {
         Ok(j) => j,
@@ -100,29 +100,29 @@ async fn handle_one(
         }
     };
 
-    // idempotency
+    // Acquire a transient idempotency lock.
     let idem_key = match idempotency_claim(pool(), &job.id, cfg.idempotency_ttl_secs).await? {
         Idem::Duplicate => return Ok(()),
         Idem::Fresh(k) => k,
     };
 
-    // encode Arrow delta (expects &[Bytes])
+    // Encode the job identifier into an Arrow IPC payload.
     let id_bytes: Vec<Bytes> = vec![Bytes::from(job.id.clone())];
     let use_zstd = cfg.ipc_compression.to_lowercase() == "zstd";
     let arrow_bytes = encode_many_ids_arrow_bytes(&id_bytes, use_zstd)?;
 
-    // S3 key: prefix/replay-deltas/<job.id>/<ts>.arrow
+    // Build the object key using the job id and current timestamp.
     let (secs, nanos) = now_unix();
     let key = format!(
         "{}/replay-deltas/{}/{}-{:09}.arrow",
         cfg.s3_prefix, job.id, secs, nanos
     );
 
-    // Content headers
+    // Configure HTTP metadata for the upload.
     let content_type = Some("application/vnd.apache.arrow.file");
     let content_encoding = if use_zstd { Some("zstd") } else { None };
 
-    // Upload
+    // Upload the object to S3.
     upload_bytes_to_s3(
         s3,
         &cfg.s3_bucket_name,
@@ -133,14 +133,14 @@ async fn handle_one(
     )
     .await?;
 
-    // release idempotency
+    // Release the idempotency guard.
     idempotency_release(pool(), idem_key).await;
     Ok(())
 }
 
 fn init_logging() {
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env()) // e.g. RUST_LOG=info,playback_compiler=debug
+        .with(EnvFilter::from_default_env()) // Example: RUST_LOG=info,playback_compiler=debug
         .with(fmt::layer().compact())
         .with(ErrorLayer::default())
         .init();

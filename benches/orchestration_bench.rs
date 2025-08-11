@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use playback_compiler::emit::{DeltaKeyBuilder, SimpleKeyBuilder};
 use playback_compiler::proto::Job;
 use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 
-/// Micro-orchestration: build key + encode bytes (no I/O).
+/// Benchmarks key construction and Arrow encoding without external I/O.
 fn bench_key_and_encode(c: &mut Criterion) {
     let kb = SimpleKeyBuilder::new("tenants/default");
     let job = Job {
@@ -13,7 +13,7 @@ fn bench_key_and_encode(c: &mut Criterion) {
 
     c.bench_function("key_build", |b| {
         b.iter(|| {
-            // rough timestamp-ish numbers; content not important for bench
+            // Use fixed timestamps; actual values are irrelevant to throughput.
             let key = kb.replay_delta_key(&job, 1_712_345_678, 123);
             criterion::black_box(key);
         })

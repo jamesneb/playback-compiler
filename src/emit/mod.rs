@@ -1,4 +1,4 @@
-//! Emit module: traits and sink exports
+//! Facilities for emitting compiled deltas to storage.
 
 use bytes::Bytes;
 
@@ -11,9 +11,8 @@ pub trait ReplaySink {
     async fn put_delta(&self, key: &str, bytes: Bytes) -> Result<(), Self::Error>;
 }
 
-/// Optional: key builder trait if you want to compute keys outside the sink.
-/// With the coalescer, we mostly compute a window key inside the sink,
-/// but we keep this here if other sinks need it.
+/// Optional trait for deriving object keys outside of a sink.
+/// Primarily used by implementations that manage their own naming scheme.
 pub trait DeltaKeyBuilder {
     fn replay_delta_key(
         &self,

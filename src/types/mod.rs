@@ -1,14 +1,5 @@
-//! Common types and small helpers
+//! Common type aliases and helper modules shared across the crate.
 //!
-//! Overview
-//! --------
-//! Centralizes lightweight type aliases and utility helpers shared across
-//! modules. Keep this module dependency-free (beyond core/std/bytes) to avoid
-//! cyclic build edges.
-//!
-//! Guidelines
-//! ----------
-//! - Prefer **type aliases** over newtypes unless invariants are enforced.
-//! - Keep helpers side-effect free; IO belongs in feature modules.
+//! This module remains dependency-light to avoid cyclic build edges.
 pub type Bytes<'a> = &'a [u8];
 pub mod fp;

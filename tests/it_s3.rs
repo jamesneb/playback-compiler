@@ -1,13 +1,13 @@
-//! Integration: S3-compatible sink (S3Mock)
-//! Validates deterministic PUT/GET round-trip for replay delta bytes.
+//! Integration test for the S3 sink using S3Mock.
+//! Ensures that uploaded deltas can be retrieved byte-for-byte.
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
+    Client,
     config::{Builder as S3ConfigBuilder, Region},
     primitives::ByteStream,
-    Client,
 };
 use bytes::Bytes;
 use playback_compiler::emit::ReplaySink;
@@ -15,8 +15,8 @@ use playback_compiler::errors::CompilerError;
 use playback_compiler::proto::Job;
 use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 use testcontainers::core::WaitFor;
-use testcontainers::{clients, GenericImage};
-use tokio::time::{sleep, Duration};
+use testcontainers::{GenericImage, clients};
+use tokio::time::{Duration, sleep};
 
 struct S3Sink {
     client: Client,
@@ -40,9 +40,9 @@ impl ReplaySink for S3Sink {
 }
 
 #[tokio::test]
-#[ignore] // run with: cargo test --test it_s3 -- --ignored
+#[ignore] // Run with: cargo test --test it_s3 -- --ignored
 async fn s3_mock_roundtrip() {
-    // Start S3Mock (listens on 9090)
+    // Start S3Mock on port 9090.
     let docker = clients::Cli::default();
     let img = GenericImage::new("adobe/s3mock", "latest")
         .with_exposed_port(9090)
@@ -51,7 +51,7 @@ async fn s3_mock_roundtrip() {
     let port = node.get_host_port_ipv4(9090);
     let endpoint = format!("http://127.0.0.1:{port}");
 
-    // AWS SDK client pinned to the mock: static creds + path-style
+    // Configure the AWS SDK client for the mock using static credentials and path-style addressing.
     let shared = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(endpoint.clone())
@@ -65,7 +65,7 @@ async fn s3_mock_roundtrip() {
 
     let client = Client::from_conf(conf);
 
-    // Create bucket with a small retry (mock may take a beat)
+    // Create the bucket with a small retry loop while the mock starts up.
     let bucket = "it-bucket";
     let mut tries = 0;
     loop {
@@ -83,20 +83,20 @@ async fn s3_mock_roundtrip() {
         }
     }
 
-    // Prepare a replay delta (new API)
+    // Prepare a single replay delta.
     let job = Job {
         id: "job-xyz".into(),
     };
     let arrow =
         encode_many_ids_arrow_bytes(&[Bytes::from_static(b"job-xyz")], false).expect("encode");
 
-    // Deterministic key so GET matches what we PUT
+    // Deterministic key so the fetched object matches the uploaded one.
     let key = format!(
         "tenants/default/replay-deltas/{}/test-000000123.arrow",
         job.id
     );
 
-    // Upload via sink
+    // Upload via the S3 sink.
     let sink = S3Sink {
         client: client.clone(),
         bucket: bucket.to_string(),
@@ -105,7 +105,7 @@ async fn s3_mock_roundtrip() {
         .await
         .expect("put");
 
-    // Fetch back & verify
+    // Fetch the object back and verify.
     let got = client
         .get_object()
         .bucket(bucket)

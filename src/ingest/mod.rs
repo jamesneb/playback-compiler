@@ -1,9 +1,7 @@
-//! Ingest abstraction
+//! Abstractions for message ingestion.
 //!
-//! Overview
-//! --------
-//! Minimal trait representing a source of messages for the compiler. Concrete
-//! implementations include Redis Streams.
+//! Defines a minimal interface for sources that supply work items to the
+//! compiler. Implementations include adapters for Redis Streams and others.
 
 use bytes::Bytes;
 
@@ -19,6 +17,7 @@ pub trait Queue {
 
     async fn pop(&self) -> Result<Option<QueueMessage>, Self::Error>;
 
-    /// Acknowledge successful processing so the backend can drop/redeliver accordingly.
+    /// Confirm that a message has been processed so the backend can
+    /// perform its retention or redelivery policy.
     async fn ack(&self, id: &str) -> Result<(), Self::Error>;
 }

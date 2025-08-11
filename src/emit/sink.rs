@@ -1,7 +1,7 @@
-//! Coalescing S3 sink with **object-level Zstd compression**.
-//! - Arrow IPC stays spec-compliant (uncompressed IPC).
-//! - We compress the entire object to .arrow.zst and set Content-Encoding: zstd.
-//! - Multipart also sets headers at create_multipart_upload.
+//! Sink that batches deltas and uploads them to S3.
+//!
+//! Data is encoded as Arrow IPC files and optionally compressed with Zstd
+//! before being stored as either single PUTs or multipart uploads.
 
 use crate::transform::encode::encode_many_ids_arrow_bytes;
 use aws_sdk_s3::Client as S3Client;
@@ -9,30 +9,47 @@ use bytes::Bytes;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{interval, Interval};
+use tokio::time::{Interval, interval};
 use tracing::{debug, error, info};
 
 use crate::emit::uploader::{multipart_upload, upload_bytes_to_s3};
 
 #[derive(Clone, Debug)]
 pub struct CoalescingConfig {
+    /// Target S3 bucket.
     pub bucket: String,
+    /// Prefix within the bucket where objects are written.
     pub prefix: String,
+    /// Maximum aggregate bytes per window.
     pub max_bytes: usize,
+    /// Maximum number of IDs per window.
     pub max_count: usize,
+    /// Maximum time a window may remain open.
     pub max_age: Duration,
+    /// Threshold at which multipart upload is used.
     pub multipart_threshold: usize,
+    /// Size of each multipart chunk.
     pub multipart_part_size: usize,
+    /// Number of parts uploaded concurrently.
     pub multipart_parallel_parts: usize,
+    /// Capacity for the input channel.
     pub channel_capacity: usize,
-    pub use_zstd_ipc: bool, // not used on Arrow 56; kept for future IPC-level compression
+    /// Placeholder for future IPC-level compression support.
+    pub use_zstd_ipc: bool,
+    /// Enable object-level Zstd compression.
     pub zstd_object: bool,
-    pub zstd_level: i32, // 1..=21 typical; 3–6 is a good tradeoff
+    /// Zstd compression level.
+    pub zstd_level: i32,
+    /// Max retry attempts for uploads.
     pub retry_max_attempts: usize,
+    /// Base delay in milliseconds between retries.
     pub retry_base_delay_ms: u64,
+    /// Interval in milliseconds for background flush checks.
     pub flush_tick_ms: u64,
-    pub content_type: String, // e.g. "application/vnd.apache.arrow.file"
-    pub content_encoding_zstd: bool, // normally true to advertise "zstd"
+    /// MIME type to set on uploaded objects.
+    pub content_type: String,
+    /// Whether to advertise `Content-Encoding: zstd`.
+    pub content_encoding_zstd: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -187,11 +204,11 @@ async fn flush_tenant(
         return Ok(());
     }
 
-    // 1) Encode Arrow IPC (uncompressed IPC).
+    // Encode ids to Arrow IPC format.
     let encoded =
         encode_many_ids_arrow_bytes(&win.ids, cfg.use_zstd_ipc /* unused on Arrow 56 */)?;
 
-    // 2) Optional object-level Zstd compression.
+    // Optionally compress the entire object with Zstd.
     let (object_bytes, key, content_type, content_encoding) = if cfg.zstd_object {
         let compressed = zstd::encode_all(&*encoded, cfg.zstd_level)?;
         let ts_ns = now_ns();
@@ -215,7 +232,7 @@ async fn flush_tenant(
         )
     };
 
-    // 3) Upload: pick single vs multipart by size
+    // Choose single or multipart upload based on object size.
     if object_bytes.len() >= cfg.multipart_threshold {
         let parts = split_parts(&object_bytes, cfg.multipart_part_size);
         multipart_upload(

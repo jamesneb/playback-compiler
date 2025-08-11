@@ -1,15 +1,15 @@
-//! S3 client utilities: single-put and multipart uploads.
+//! Helper functions for uploading objects to S3.
 
 use anyhow::Result;
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use aws_sdk_s3::Client;
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Build an S3 client from environment (AWS_* vars, optional endpoint override).
+/// Construct an S3 client using environment configuration.
 pub async fn create_s3_client_from_env() -> Client {
     dotenvy::dotenv().ok();
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
@@ -20,7 +20,7 @@ pub async fn create_s3_client_from_env() -> Client {
     Client::new(&cfg)
 }
 
-/// Simple single-object PUT (small payloads).
+/// Upload a single object to S3.
 pub async fn upload_bytes_to_s3(
     client: &Client,
     bucket: &str,
@@ -48,10 +48,10 @@ pub async fn upload_bytes_to_s3(
     Ok(())
 }
 
-/// Multipart upload of pre-chunked parts with bounded parallelism.
-/// - `parts`: vector of (part_number, part_bytes).
-/// - `parallel_parts`: degree of parallelism for uploading parts.
-/// - `content_type` / `content_encoding`: set as object metadata (multipart doesn’t set per-part content-type).
+/// Upload pre-chunked parts using S3 multipart semantics.
+/// - `parts`: `(part_number, bytes)` tuples.
+/// - `parallel_parts`: number of concurrent part uploads.
+/// - `content_type` / `content_encoding`: object metadata applied at completion.
 pub async fn multipart_upload(
     client: &Client,
     bucket: &str,
@@ -61,7 +61,7 @@ pub async fn multipart_upload(
     content_type: Option<&str>,
     content_encoding: Option<&str>,
 ) -> Result<()> {
-    // 1) Initiate multipart, attach object metadata here
+    // Initiate the multipart upload and set object metadata.
     let mut init = client.create_multipart_upload().bucket(bucket).key(key);
     if let Some(ct) = content_type {
         init = init.content_type(ct);
@@ -72,7 +72,7 @@ pub async fn multipart_upload(
     let init = init.send().await?;
     let upload_id_master = Arc::new(init.upload_id().unwrap_or_default().to_string());
 
-    // 2) Upload parts in parallel; every task clones its own upload id/String
+    // Upload each part concurrently; every task clones the upload ID.
     let completed_parts: Result<Vec<CompletedPart>> = {
         let futs = parts.into_iter().map(|(part_number, buf)| {
             let client = client.clone();
@@ -86,7 +86,7 @@ pub async fn multipart_upload(
                     .upload_part()
                     .bucket(&bucket)
                     .key(&key)
-                    .upload_id((*upload_id_master).clone()) // fresh String for each request
+                    .upload_id((*upload_id_master).clone()) // Clone upload ID for each request
                     .part_number(part_number)
                     .content_length(len)
                     .body(ByteStream::from(buf))
@@ -114,7 +114,7 @@ pub async fn multipart_upload(
         Ok(acc)
     };
 
-    // 3) Complete or abort
+    // Finalize the upload or abort on failure.
     match completed_parts {
         Ok(parts) => {
             let completed = CompletedMultipartUpload::builder()

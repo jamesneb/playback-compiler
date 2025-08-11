@@ -1,28 +1,20 @@
-//! Small functional utilities for ergonomic error/result handling
+//! Utility helpers for lightweight error handling and Redis interactions.
 //!
-//! Overview
-//! --------
-//! Helpers to reduce boilerplate around pooled-connection usage, DLQ publishing,
-//! and simple idempotency guards. These are intentionally minimal and crate-
-//! local building blocks used by higher-level modules.
-//!
-//! Notes
-//! -----
-//! - Keep this module dependency-light.
-//! - Use at module edges to keep orchestration code concise.
+//! Provides small building blocks such as connection helpers, dead-letter
+//! publishing, and simple idempotency guards.
 
 use crate::errors::CompilerError;
 use bytes::Bytes;
 use deadpool_redis::{
-    redis::{cmd, AsyncCommands},
     Pool,
+    redis::{AsyncCommands, cmd},
 };
 use tracing::info;
 
-// ========= Connection helper =========
+// --- Connection helper ---
 
-/// Borrow a pooled Redis connection and run the provided async action.
-/// Maps pool errors into `CompilerError` at the edge.
+/// Acquire a Redis connection from the pool and execute the given async action.
+/// Pool errors are converted to `CompilerError` values.
 pub async fn with_conn<T, F, Fut>(pool: &Pool, f: F) -> Result<T, CompilerError>
 where
     F: FnOnce(deadpool_redis::Connection) -> Fut,
@@ -35,10 +27,10 @@ where
     f(conn).await
 }
 
-// ========= DLQ publishing =========
+// --- DLQ publishing ---
 
-/// Publish a failure event to a Redis Stream (DLQ).
-/// Fields: `reason`, binary `payload`, optional `job_id`.
+/// Publish a failure event to a Redis stream acting as a DLQ.
+/// Includes the reason, payload bytes, and optional job identifier.
 #[tracing::instrument(skip(pool, payload))]
 pub async fn publish_dlq(
     pool: &Pool,
@@ -67,18 +59,18 @@ pub async fn publish_dlq(
     .await
 }
 
-// ========= Idempotency guard =========
+// --- Idempotency guard ---
 
-/// Result of an idempotency claim attempt.
+/// Outcome of an idempotency claim attempt.
 pub enum Idem {
-    /// First claimant; returns the stored key so the caller can release if needed.
+    /// Claim succeeded; caller receives the redis key for later release.
     Fresh(String),
-    /// Claim already exists (duplicate work should be skipped).
+    /// Marker already exists, indicating duplicate work.
     Duplicate,
 }
 
-/// Create a time-bounded idempotency marker for `job_id`.
-/// Returns `Fresh(key)` if this caller owns the claim, otherwise `Duplicate`.
+/// Attempt to set a TTL-bound idempotency marker for `job_id`.
+/// Returns `Fresh(key)` on success or `Duplicate` if already claimed.
 #[tracing::instrument(skip(pool, job_id, ttl_secs))]
 
 pub async fn idempotency_claim(
@@ -88,7 +80,7 @@ pub async fn idempotency_claim(
 ) -> Result<Idem, CompilerError> {
     let key = format!("processed:{job_id}");
     with_conn(pool, |mut c| async move {
-        // SETNX: set only if not exists
+        // SETNX: set only if the key does not already exist.
         let first: bool = c
             .set_nx(&key, 1)
             .await
@@ -98,7 +90,7 @@ pub async fn idempotency_claim(
             return Ok(Idem::Duplicate);
         }
 
-        // EXPIRE: clamp TTL to i64::MAX to satisfy redis-rs signature
+        // EXPIRE: clamp TTL to `i64::MAX` to satisfy the redis-rs signature.
         let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
         let _: () = c
             .expire(&key, ttl)
@@ -110,8 +102,8 @@ pub async fn idempotency_claim(
     .await
 }
 
-/// Best-effort release of an idempotency marker.
-/// Fire-and-forget semantics: errors are swallowed by design.
+/// Remove the idempotency marker without propagating errors.
+/// The operation is fire-and-forget.
 #[tracing::instrument(skip(pool, key))]
 pub async fn idempotency_release(pool: &Pool, key: String) {
     let _ = with_conn(pool, |mut c| async move {

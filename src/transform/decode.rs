@@ -1,9 +1,7 @@
-//! Job decoding (Protobuf)
+//! Decode Protobuf job payloads into typed `Job` instances.
 //!
-//! Overview
-//! --------
-//! Decodes inbound job payloads (protobuf) into a typed `Job`. Invalid payloads
-//! return a descriptive error for caller-controlled routing (e.g., DLQ).
+//! Invalid bytes yield a structured error so callers can route failures
+//! appropriately.
 
 use bytes::Bytes;
 
