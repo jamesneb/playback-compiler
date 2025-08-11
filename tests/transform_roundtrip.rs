@@ -1,13 +1,11 @@
-//! Unit: Arrow encode/round-trip
-//! Verifies that encoded deltas can be read back and contain the expected ids.
-
-use arrow::array::Array;
-use arrow::array::StringArray;
+//! Unit: Arrow encode/round-trip (BinaryArray)
+use arrow::array::{Array, BinaryArray};
 use arrow::ipc::reader::FileReader;
 use bytes::Bytes;
 use playback_compiler::proto::Job;
-use playback_compiler::transform::{decode::decode_job, encode::encode_replay_delta_arrow};
+use playback_compiler::transform::{decode::decode_job, encode::encode_many_ids_arrow_bytes};
 use std::io::Cursor;
+
 #[test]
 fn decode_rejects_garbage() {
     let payload = Bytes::from_static(b"\x00\x01\x02");
@@ -18,23 +16,23 @@ fn decode_rejects_garbage() {
 
 #[test]
 fn arrow_contains_id_roundtrip() {
-    let job = Job {
-        id: "abc-123".into(),
-    };
-    let bytes = encode_replay_delta_arrow(&job).expect("encode");
+    let id = "abc-123".to_string();
+    let _job = Job { id: id.clone() };
+
+    let bytes = encode_many_ids_arrow_bytes(&[Bytes::from(id.clone())], false).expect("encode");
     assert!(!bytes.is_empty(), "arrow bytes should not be empty");
 
     let mut reader = FileReader::try_new(Cursor::new(bytes), None).expect("reader");
     let mut found = false;
     for batch in &mut reader {
         let b = batch.expect("batch");
-        let sa = b
+        let ba = b
             .column(0)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("utf8 column 0");
-        for i in 0..sa.len() {
-            if sa.value(i) == "abc-123" {
+            .downcast_ref::<BinaryArray>()
+            .expect("binary column 0");
+        for i in 0..ba.len() {
+            if ba.value(i) == id.as_bytes() {
                 found = true;
                 break;
             }

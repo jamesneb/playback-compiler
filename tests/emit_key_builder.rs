@@ -18,7 +18,6 @@ fn simple_key_builder_allows_unicode_ids() {
         id: "服务-λ".into(),
     };
     let key = kb.replay_delta_key(&job, 100, 7);
-    // We don’t assert the whole key—just key parts are present; encoding rules are yours.
     assert!(key.starts_with("pfx/replay-deltas/"));
     assert!(key.contains("100-000000007"));
     assert!(key.ends_with(".arrow"));

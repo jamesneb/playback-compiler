@@ -1,14 +1,14 @@
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, BinaryArray};
 use arrow::ipc::reader::FileReader;
 use bytes::Bytes;
 use playback_compiler::proto::Job;
-use playback_compiler::transform::{decode::decode_job, encode::encode_replay_delta_arrow};
+use playback_compiler::transform::decode::decode_job;
+use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use std::io::Cursor;
 
 // IDs: mix ASCII (no newlines) and general Unicode scalar values.
-// - The Unicode generator uses `char` (scalar values only; no surrogates).
 fn any_id() -> impl Strategy<Value = String> {
     let ascii = string_regex(r"[^\n]{0,1024}").unwrap();
     let unicode = proptest::collection::vec(any::<char>(), 0..512)
@@ -20,17 +20,19 @@ proptest! {
   // encode → arrow → read back → contains id
   #[test]
   fn arrow_roundtrips_id(id in any_id()) {
-      let job = Job { id: id.clone() };
-      let bytes = encode_replay_delta_arrow(&job).expect("encode");
+      // (Job is not strictly needed, keep to mirror real usage)
+      let _job = Job { id: id.clone() };
+
+      let bytes = encode_many_ids_arrow_bytes(&[Bytes::from(id.clone())], false).expect("encode");
       prop_assume!(!bytes.is_empty());
 
       let mut reader = FileReader::try_new(Cursor::new(bytes), None).expect("reader");
       let mut found = false;
       for rb in &mut reader {
           let b = rb.expect("batch");
-          let sa = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-          for i in 0..sa.len() {
-              if sa.value(i) == id { found = true; break; }
+          let ba = b.column(0).as_any().downcast_ref::<BinaryArray>().expect("binary col 0");
+          for i in 0..ba.len() {
+              if ba.value(i) == id.as_bytes() { found = true; break; }
           }
           if found { break; }
       }

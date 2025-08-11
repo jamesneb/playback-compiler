@@ -10,10 +10,10 @@ use aws_sdk_s3::{
     Client,
 };
 use bytes::Bytes;
-use playback_compiler::emit::ReplaySink; // <-- bring trait into scope
+use playback_compiler::emit::ReplaySink;
 use playback_compiler::errors::CompilerError;
 use playback_compiler::proto::Job;
-use playback_compiler::transform::encode::encode_replay_delta_arrow;
+use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 use testcontainers::core::WaitFor;
 use testcontainers::{clients, GenericImage};
 use tokio::time::{sleep, Duration};
@@ -83,11 +83,12 @@ async fn s3_mock_roundtrip() {
         }
     }
 
-    // Prepare a replay delta
+    // Prepare a replay delta (new API)
     let job = Job {
         id: "job-xyz".into(),
     };
-    let arrow = encode_replay_delta_arrow(&job).expect("encode");
+    let arrow =
+        encode_many_ids_arrow_bytes(&[Bytes::from_static(b"job-xyz")], false).expect("encode");
 
     // Deterministic key so GET matches what we PUT
     let key = format!(

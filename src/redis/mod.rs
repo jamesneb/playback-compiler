@@ -1,7 +1,8 @@
 //! Redis Streams integration (single version of `redis` via deadpool-redis)
 
 use crate::errors::CompilerError;
-use crate::ingest::{Queue, QueueMessage};
+use crate::ingest::Queue;
+pub use crate::ingest::QueueMessage;
 use bytes::Bytes;
 use deadpool_redis::redis::{self};
 use deadpool_redis::{Config, Pool, Runtime};
@@ -140,7 +141,7 @@ impl Queue for RedisStreamQueue {
 
 /// Parse the `XREADGROUP` redis::Value reply into QueueMessage list.
 /// We stay purely on the deadpool-redis `redis` crate to avoid type/version conflicts.
-pub(crate) fn parse_xread_value(val: redis::Value) -> Vec<QueueMessage> {
+pub fn parse_xread_value(val: redis::Value) -> Vec<QueueMessage> {
     use deadpool_redis::redis::Value;
     let mut out = Vec::new();
 

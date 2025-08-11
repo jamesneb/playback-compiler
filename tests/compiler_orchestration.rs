@@ -6,10 +6,10 @@ use bytes::Bytes;
 use prost::Message;
 use tokio::sync::Mutex as AsyncMutex;
 
-use playback_compiler::emit::{emit_replay_delta, ReplaySink, SimpleKeyBuilder};
+use playback_compiler::emit::{DeltaKeyBuilder, ReplaySink, SimpleKeyBuilder};
 use playback_compiler::errors::CompilerError;
 use playback_compiler::proto::Job;
-use playback_compiler::transform::{decode::decode_job, encode::encode_replay_delta_arrow};
+use playback_compiler::transform::{decode::decode_job, encode::encode_many_ids_arrow_bytes};
 
 /// ---- Fakes -----
 
@@ -87,7 +87,7 @@ impl ReplaySink for FakeSink {
 /// Returns: ("ack" flag, maybe dlq_reason)
 async fn process_one(
     payload: Bytes,
-    // NOTE: add + Sync to satisfy emit_replay_delta bound
+    // NOTE: add + Sync to satisfy ReplaySink bound used in prod
     sink: &(impl ReplaySink<Error = CompilerError> + Sync),
     key_builder: &SimpleKeyBuilder,
     idem: &FakeIdem,
@@ -105,22 +105,26 @@ async fn process_one(
     // idempotency
     match idem.claim(&job.id).await {
         Claim::Duplicate => (true, None), // ack, no emit
-        Claim::Fresh(key) => {
-            // encode
-            let bytes = match encode_replay_delta_arrow(&job) {
+        Claim::Fresh(idem_key) => {
+            // encode (new API)
+            let id_bytes = Bytes::from(job.id.clone().into_bytes());
+            let bytes = match encode_many_ids_arrow_bytes(&[id_bytes], false) {
                 Ok(b) => b,
                 Err(e) => {
-                    idem.release(key).await;
+                    idem.release(idem_key).await; // release the *idempotency* key
                     dlq.publish("encode_error", Some(&job.id), &payload);
                     return (false, Some(format!("encode_error:{e:?}")));
                 }
             };
 
+            // build S3 key (separate name to avoid shadowing)
+            let s3_key = key_builder.replay_delta_key(&job, 1_712_345_678, 123);
+
             // emit to sink; on failure, release idempotency and DLQ
-            match emit_replay_delta(sink, key_builder, &job, bytes).await {
+            match sink.put_delta(&s3_key, Bytes::from(bytes)).await {
                 Ok(_) => (true, None),
                 Err(e) => {
-                    idem.release(key).await;
+                    idem.release(idem_key).await; // release the *idempotency* key
                     dlq.publish("process_error", Some(&job.id), &payload);
                     (false, Some(format!("process_error:{e:?}")))
                 }
@@ -171,7 +175,6 @@ async fn duplicate_job_is_acked_no_emit() {
     let idem = FakeIdem::default();
     let dlq = FakeDLQ::default();
 
-    // first time: should emit and ack
     let (acked1, reason1) = process_one(encode_job("A"), &sink, &key_builder, &idem, &dlq).await;
     assert!(acked1);
     assert!(reason1.is_none());

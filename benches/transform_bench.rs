@@ -1,35 +1,37 @@
-//! Bench: Arrow encode
-//! Measures encode latency across varying id lengths for replay deltas.
-
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use playback_compiler::proto::Job;
-use playback_compiler::transform::encode::encode_replay_delta_arrow;
+use bytes::Bytes;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 use rand::{distributions::Alphanumeric, Rng};
 
-fn random_id(n: usize) -> String {
+fn rand_id(len: usize) -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
-        .take(n)
+        .take(len)
         .map(char::from)
         .collect()
 }
 
-fn bench_encode(c: &mut Criterion) {
-    let mut g = c.benchmark_group("encode_replay_delta_arrow");
-    for &len in &[8usize, 64, 512, 4096] {
-        g.bench_with_input(format!("id_len_{len}"), &len, |b, &n| {
-            b.iter_batched(
-                || Job { id: random_id(n) },
-                |job| {
-                    let bytes = encode_replay_delta_arrow(&job).expect("encode");
-                    black_box(bytes);
-                },
-                BatchSize::SmallInput,
-            )
+fn bench_encode_many_ids(c: &mut Criterion) {
+    let mut group = c.benchmark_group("encode_many_ids_arrow");
+    for &n_ids in &[1usize, 8, 64, 512, 4096] {
+        group.bench_with_input(BenchmarkId::from_parameter(n_ids), &n_ids, |b, &n| {
+            // Prepare a fixed input set per iteration size
+            let ids: Vec<Bytes> = (0..n)
+                .map(|i| {
+                    // vary length a little to avoid degenerate layouts
+                    let s = rand_id(8 + (i % 17));
+                    Bytes::from(s)
+                })
+                .collect();
+
+            b.iter(|| {
+                let out = encode_many_ids_arrow_bytes(&ids, false).expect("encode");
+                criterion::black_box(out);
+            });
         });
     }
-    g.finish();
+    group.finish();
 }
 
-criterion_group!(benches, bench_encode);
+criterion_group!(benches, bench_encode_many_ids);
 criterion_main!(benches);
