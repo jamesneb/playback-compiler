@@ -1,45 +1,32 @@
-//! Emit layer (replay sinks and keying)
-//!
-//! Overview
-//! --------
-//! Defines the sink abstraction for replay deltas and strategies to build
-//! storage keys. Concrete sinks (e.g., S3) live in submodules.
-//!
-//! Error Model
-//! -----------
-//! - `ReplaySink::Error` is sink-specific and mapped by callers.
-//!
-//! Concurrency / Performance
-//! -------------------------
-//! - Sinks are async. Implementations should avoid unnecessary copies.
+//! Emit module: traits and sink exports
 
-use crate::{errors::CompilerError, proto::Job};
 use bytes::Bytes;
 
-pub mod dlq;
+pub mod sink;
 pub mod uploader;
 
-use async_trait::async_trait;
-
-// ========= Traits =========
-
-#[async_trait]
+#[async_trait::async_trait]
 pub trait ReplaySink {
     type Error;
     async fn put_delta(&self, key: &str, bytes: Bytes) -> Result<(), Self::Error>;
 }
 
+/// Optional: key builder trait if you want to compute keys outside the sink.
+/// With the coalescer, we mostly compute a window key inside the sink,
+/// but we keep this here if other sinks need it.
 pub trait DeltaKeyBuilder {
-    fn replay_delta_key(&self, job: &Job, now_unix_secs: u64, now_nanos: u32) -> String;
+    fn replay_delta_key(
+        &self,
+        _job: &crate::proto::Job,
+        now_unix_secs: u64,
+        now_nanos: u32,
+    ) -> String;
 }
-
-// ========= Keying =========
 
 #[derive(Clone)]
 pub struct SimpleKeyBuilder {
     pub prefix: String,
 }
-
 impl SimpleKeyBuilder {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
@@ -47,29 +34,16 @@ impl SimpleKeyBuilder {
         }
     }
 }
-
 impl DeltaKeyBuilder for SimpleKeyBuilder {
-    fn replay_delta_key(&self, job: &Job, s: u64, n: u32) -> String {
+    fn replay_delta_key(
+        &self,
+        job: &crate::proto::Job,
+        now_unix_secs: u64,
+        now_nanos: u32,
+    ) -> String {
         format!(
             "{}/replay-deltas/{}/{}-{:09}.arrow",
-            self.prefix, job.id, s, n
+            self.prefix, job.id, now_unix_secs, now_nanos
         )
     }
-}
-
-// ========= API =========
-
-pub async fn emit_replay_delta<S: ReplaySink + Sync>(
-    sink: &S,
-    key_builder: &impl DeltaKeyBuilder,
-    job: &Job,
-    bytes: Bytes,
-) -> Result<(), CompilerError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let key = key_builder.replay_delta_key(job, now.as_secs(), now.subsec_nanos());
-    sink.put_delta(&key, bytes)
-        .await
-        .map_err(|_| CompilerError::JobProcessingError("replay sink put failed".into()))
 }
