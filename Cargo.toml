@@ -43,6 +43,7 @@ async-trait = "0.1"
 tracing-appender = "0.2"
 aws-credential-types = "1.2.5"
 hostname = "0.4.1"
+futures-util = "0.3.31"
 
 [dev-dependencies]
 testcontainers = "0.15"
@@ -62,3 +63,6 @@ harness = false
 [build-dependencies]
 prost-build = "0.14.1"
 tonic-build = "0.14.0"
+
+[profile.release]
+panic = "abort"

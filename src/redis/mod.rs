@@ -3,6 +3,7 @@
 use crate::errors::CompilerError;
 use crate::ingest::Queue;
 pub use crate::ingest::QueueMessage;
+use crate::types::fp::{idempotency_claim, idempotency_release, publish_dlq, Idem};
 use bytes::Bytes;
 use deadpool_redis::redis::{self};
 use deadpool_redis::{Config, Pool, Runtime};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 static REDIS_POOL: OnceCell<Pool> = OnceCell::new();
 
-pub async fn init_redis_pool(redis_url: &str) -> Result<(), CompilerError> {
+pub fn init_redis_pool(redis_url: &str) -> Result<(), CompilerError> {
     let cfg = Config::from_url(redis_url);
     let pool = cfg
         .create_pool(Some(Runtime::Tokio1))
@@ -36,14 +37,25 @@ pub struct RedisStreamQueue {
 }
 
 impl RedisStreamQueue {
-    pub fn new(pool: Pool, stream: &str, group: &str, consumer: &str) -> Self {
-        Self {
-            pool,
+    pub fn pool_clone(&self) -> Pool {
+        self.pool.clone()
+    }
+    pub fn from_url(
+        stream: &str,
+        group: &str,
+        consumer: &str,
+        url: &str,
+    ) -> Result<Self, CompilerError> {
+        init_redis_pool(url)?;
+
+        let p = pool().clone();
+        Ok(Self {
+            pool: p,
             stream: stream.to_string(),
             group: group.to_string(),
             consumer: consumer.to_string(),
             read_timeout_ms: 5_000,
-        }
+        })
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -196,4 +208,40 @@ pub fn parse_xread_value(val: redis::Value) -> Vec<QueueMessage> {
     }
 
     out
+}
+
+#[derive(Clone)]
+pub struct RedisControlPlane {
+    pool: Pool,
+    dlq_stream: String,
+}
+
+impl RedisControlPlane {
+    pub fn new(pool: Pool, dlq_stream: impl Into<String>) -> Self {
+        Self {
+            pool,
+            dlq_stream: dlq_stream.into(),
+        }
+    }
+
+    pub fn from_url(url: &str, dlq_stream: impl Into<String>) -> Result<Self, CompilerError> {
+        init_redis_pool(url)?;
+        Ok(Self::new(pool().clone(), dlq_stream))
+    }
+
+    pub async fn claim(&self, job_id: &str, ttl_secs: u64) -> Result<Idem, CompilerError> {
+        idempotency_claim(&self.pool, job_id, ttl_secs).await
+    }
+
+    pub async fn release(&self, key: String) {
+        idempotency_release(&self.pool, key).await;
+    }
+
+    pub async fn dlq(&self, reason: &str, payload: &bytes::Bytes) -> Result<(), CompilerError> {
+        publish_dlq(&self.pool, &self.dlq_stream, reason, None, payload).await
+    }
+
+    pub fn pool_clone(&self) -> Pool {
+        self.pool.clone()
+    }
 }

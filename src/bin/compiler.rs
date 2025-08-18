@@ -1,158 +1,52 @@
 //! Command-line entry point for the compiler service.
 
-use bytes::Bytes;
-use playback_compiler::config::load_config;
-use playback_compiler::emit::uploader::{create_s3_client_from_env, upload_bytes_to_s3};
-use playback_compiler::ingest::Queue;
-use playback_compiler::proto::Job;
-use playback_compiler::redis::{RedisStreamQueue, init_redis_pool, pool};
-use playback_compiler::transform::decode::decode_job;
-use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
-use playback_compiler::types::fp::{Idem, idempotency_claim, idempotency_release, publish_dlq};
+use std::sync::Arc;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::signal;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use playback_compiler::app::run;
+use playback_compiler::config::load_config;
+use playback_compiler::redis::{RedisControlPlane, RedisStreamQueue};
+use playback_compiler::s3::S3Client;
+use playback_compiler::util::ids::unique_consumer;
+
 use tracing::{error, info};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
-    let cfg = load_config()?;
+    let cfg = Arc::new(load_config()?);
     info!("compiler starting; queue={}", cfg.job_queue_name);
 
-    init_redis_pool(&cfg.redis_url).await?;
-    let s3 = create_s3_client_from_env().await;
-
-    let consumer = unique_consumer();
-    let queue = RedisStreamQueue::new(pool().clone(), &cfg.job_queue_name, "compilers", &consumer);
+    // Backends
+    let store = S3Client::from_env().await;
+    let queue = RedisStreamQueue::from_url(
+        &cfg.job_queue_name,
+        "compilers",
+        &unique_consumer(),
+        &cfg.redis_url,
+    )?;
     queue.ensure_stream_group().await?;
 
+    // Control-plane (idempotency + DLQ) shares the same pool
+    let cp = Arc::new(RedisControlPlane::new(queue.pool_clone(), "dlq:compiler"));
+
+    // Run (monomorphized over Queue + BlobStore)
     let permits = cfg.pipeline_parallelism.max(1);
-    let semaphore = std::sync::Arc::new(Semaphore::new(permits));
-    let mut join = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                info!("ctrl-c: draining");
-                break;
-            }
-            popped = queue.pop() => {
-                match popped {
-                    Ok(Some(msg)) => {
-                        let sem = semaphore.clone();
-                        let s3_cl = s3.clone();
-                        let cfg_cl = cfg.clone();
-                        let q_cl = queue.clone();
-
-                        join.spawn(async move {
-                            let _permit = sem.acquire_owned().await.expect("semaphore");
-                            if let Err(e) = handle_one(msg.payload.to_vec(), &q_cl, &s3_cl, &cfg_cl).await {
-                                error!(error=?e, "job failed");
-                            } else if let Err(e) = q_cl.ack(&msg.id).await {
-                                error!(error=?e, "ack failed");
-                            }
-                        });
-                    }
-                    Ok(None) => { /* No message available; poll again */ }
-                    Err(e) => {
-                        error!(error=?e, "pop failed");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                }
-            }
-            Some(res) = join.join_next() => {
-                if let Err(e) = res {
-                    error!(error=?e, "task join error");
-                }
-            }
-        }
-    }
-
-    while let Some(res) = join.join_next().await {
-        if let Err(e) = res {
-            error!(error=?e, "task join error during drain");
-        }
+    if let Err(e) = run(queue, store, cp, cfg.clone(), permits).await {
+        error!(error=?e, "fatal error");
+        return Err(e);
     }
 
     info!("compiler stopped");
     Ok(())
 }
 
-async fn handle_one(
-    raw: Vec<u8>,
-    _queue: &RedisStreamQueue,
-    s3: &aws_sdk_s3::Client,
-    cfg: &playback_compiler::config::Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Decode the inbound job payload.
-    let raw_b = Bytes::from(raw);
-    let job: Job = match decode_job(&raw_b) {
-        Ok(j) => j,
-        Err(e) => {
-            let _ = publish_dlq(pool(), "dlq:compiler", "decode_error", None, &raw_b).await;
-            return Err(e.into());
-        }
-    };
-
-    // Acquire a transient idempotency lock.
-    let idem_key = match idempotency_claim(pool(), &job.id, cfg.idempotency_ttl_secs).await? {
-        Idem::Duplicate => return Ok(()),
-        Idem::Fresh(k) => k,
-    };
-
-    // Encode the job identifier into an Arrow IPC payload.
-    let id_bytes: Vec<Bytes> = vec![Bytes::from(job.id.clone())];
-    let use_zstd = cfg.ipc_compression.to_lowercase() == "zstd";
-    let arrow_bytes = encode_many_ids_arrow_bytes(&id_bytes, use_zstd)?;
-
-    // Build the object key using the job id and current timestamp.
-    let (secs, nanos) = now_unix();
-    let key = format!(
-        "{}/replay-deltas/{}/{}-{:09}.arrow",
-        cfg.s3_prefix, job.id, secs, nanos
-    );
-
-    // Configure HTTP metadata for the upload.
-    let content_type = Some("application/vnd.apache.arrow.file");
-    let content_encoding = if use_zstd { Some("zstd") } else { None };
-
-    // Upload the object to S3.
-    upload_bytes_to_s3(
-        s3,
-        &cfg.s3_bucket_name,
-        &key,
-        arrow_bytes,
-        content_type,
-        content_encoding,
-    )
-    .await?;
-
-    // Release the idempotency guard.
-    idempotency_release(pool(), idem_key).await;
-    Ok(())
-}
-
 fn init_logging() {
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env()) // Example: RUST_LOG=info,playback_compiler=debug
+        .with(EnvFilter::from_default_env())
         .with(fmt::layer().compact())
         .with(ErrorLayer::default())
         .init();
-}
-
-fn unique_consumer() -> String {
-    format!("c-{}", std::process::id())
-}
-
-fn now_unix() -> (u64, u32) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0));
-    (now.as_secs(), now.subsec_nanos())
 }

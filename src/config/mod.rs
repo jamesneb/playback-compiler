@@ -14,7 +14,7 @@ pub struct Config {
     pub s3_prefix: String,
 
     /// TTL in seconds for idempotency claims.
-    pub idempotency_ttl_secs: usize,
+    pub idempotency_ttl_secs: u64,
 
     /// Maximum bytes per coalescing window.
     pub window_max_bytes: usize,

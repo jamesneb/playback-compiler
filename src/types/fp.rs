@@ -6,8 +6,8 @@
 use crate::errors::CompilerError;
 use bytes::Bytes;
 use deadpool_redis::{
+    redis::{cmd, AsyncCommands},
     Pool,
-    redis::{AsyncCommands, cmd},
 };
 use tracing::info;
 
@@ -76,7 +76,7 @@ pub enum Idem {
 pub async fn idempotency_claim(
     pool: &Pool,
     job_id: &str,
-    ttl_secs: usize,
+    ttl_secs: u64,
 ) -> Result<Idem, CompilerError> {
     let key = format!("processed:{job_id}");
     with_conn(pool, |mut c| async move {

@@ -1,13 +1,50 @@
-//! Helper functions for uploading objects to S3.
-
+use crate::emit::BlobStore;
 use anyhow::Result;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Region;
+use aws_config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::CompletedPart;
+use aws_sdk_s3::Client;
 use futures::StreamExt;
 use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct S3Client {
+    client: Client,
+}
+impl S3Client {
+    pub async fn from_env() -> Self {
+        let client = create_s3_client_from_env().await;
+        Self { client }
+    }
+}
+
+// We use RPIT over async fn so that we can express the Send trait bound
+// Needed for tokio multithreading
+#[allow(clippy::manual_async_fn)]
+impl BlobStore for S3Client {
+    fn put_bytes<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        data: Vec<u8>,
+        content_type: Option<&'a str>,
+        content_encoding: Option<&'a str>,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async move {
+            upload_bytes_to_s3(
+                &self.client,
+                bucket,
+                key,
+                data,
+                content_type,
+                content_encoding,
+            )
+            .await
+        }
+    }
+}
 
 /// Construct an S3 client using environment configuration.
 pub async fn create_s3_client_from_env() -> Client {
