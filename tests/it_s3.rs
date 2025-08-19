@@ -1,41 +1,47 @@
 //! Integration test for the S3 sink using S3Mock.
 //! Ensures that uploaded deltas can be retrieved byte-for-byte.
 
-use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    Client,
     config::{Builder as S3ConfigBuilder, Region},
     primitives::ByteStream,
+    Client,
 };
 use bytes::Bytes;
-use playback_compiler::emit::ReplaySink;
-use playback_compiler::errors::CompilerError;
+use playback_compiler::emit::BlobStore;
 use playback_compiler::proto::Job;
 use playback_compiler::transform::encode::encode_many_ids_arrow_bytes;
 use testcontainers::core::WaitFor;
-use testcontainers::{GenericImage, clients};
-use tokio::time::{Duration, sleep};
+use testcontainers::{clients, GenericImage};
+use tokio::time::{sleep, Duration};
 
+#[derive(Clone, Debug)]
 struct S3Sink {
     client: Client,
     bucket: String,
 }
 
-#[async_trait]
-impl ReplaySink for S3Sink {
-    type Error = CompilerError;
-    async fn put_delta(&self, key: &str, bytes: Bytes) -> Result<(), Self::Error> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes.to_vec()))
-            .send()
-            .await
-            .map_err(|e| CompilerError::JobProcessingError(format!("put_object error: {e:?}")))?;
-        Ok(())
+impl BlobStore for S3Sink {
+    fn put_bytes<'a>(
+        &'a self,
+        _bucket: &'a str,
+        key: &'a str,
+        data: Vec<u8>,
+        _content_type: Option<&'a str>,
+        _content_encoding: Option<&'a str>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
+        async move {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(data))
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::Error::new(e))
+        }
     }
 }
 
@@ -96,12 +102,19 @@ async fn s3_mock_roundtrip() {
         job.id
     );
 
-    // Upload via the S3 sink.
-    let sink = S3Sink {
+    // Upload via the S3 store.
+    let store = S3Sink {
         client: client.clone(),
         bucket: bucket.to_string(),
     };
-    sink.put_delta(&key, Bytes::from(arrow.clone()))
+    store
+        .put_bytes(
+            bucket,
+            &key,
+            Bytes::from(arrow.clone()).to_vec(),
+            Some(""),
+            Some(""),
+        )
         .await
         .expect("put");
 

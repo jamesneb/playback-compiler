@@ -3,10 +3,10 @@
 use bytes::Bytes;
 use deadpool_redis::redis;
 use testcontainers::core::WaitFor;
-use testcontainers::{GenericImage, clients};
+use testcontainers::{clients, GenericImage};
 
 use playback_compiler::ingest::Queue;
-use playback_compiler::redis::{RedisStreamQueue, init_redis_pool, pool};
+use playback_compiler::redis::RedisStreamQueue;
 
 #[tokio::test]
 async fn redis_streams_end_to_end() {
@@ -17,14 +17,12 @@ async fn redis_streams_end_to_end() {
     let port = node.get_host_port_ipv4(6379);
     let url = format!("redis://127.0.0.1:{port}");
 
-    init_redis_pool(&url).await.unwrap();
-
     // Pop a message and acknowledge it.
-    let q = RedisStreamQueue::new(pool().clone(), "jobs", "compilers", "c1");
-    q.ensure_stream_group().await.unwrap();
+    let q = RedisStreamQueue::from_url("jobs", "compilers", "c1", &url).expect("queue");
+    q.ensure_stream_group().await.expect("stream group");
 
     {
-        let mut conn = pool().get().await.unwrap();
+        let mut conn = q.pool_clone().get().await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg("jobs")
             .arg("*")
@@ -35,12 +33,15 @@ async fn redis_streams_end_to_end() {
             .unwrap();
     }
 
-    let msg = q.pop().await.unwrap().expect("expected one message");
+    let msg = match q.pop().await.expect("pop") {
+        Some(msg) => msg,
+        None => panic!("no message"),
+    };
     assert_eq!(msg.payload, Bytes::from_static(b"hello"));
-    q.ack(&msg.id).await.unwrap();
+    q.ack(&msg.id).await.expect("ack");
 
     {
-        let mut conn = pool().get().await.unwrap();
+        let mut conn = q.pool_clone().get().await.unwrap();
         let val: redis::Value = redis::cmd("XPENDING")
             .arg("jobs")
             .arg("compilers")

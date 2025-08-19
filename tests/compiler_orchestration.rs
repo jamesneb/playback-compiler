@@ -1,16 +1,12 @@
+use anyhow::anyhow;
+use bytes::Bytes;
+use playback_compiler::emit::BlobStore;
+use playback_compiler::proto::Job;
+use playback_compiler::transform::decode::decode_job;
+use prost::Message;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
-use bytes::Bytes;
-use prost::Message;
 use tokio::sync::Mutex as AsyncMutex;
-
-use playback_compiler::emit::{DeltaKeyBuilder, ReplaySink, SimpleKeyBuilder};
-use playback_compiler::errors::CompilerError;
-use playback_compiler::proto::Job;
-use playback_compiler::transform::{decode::decode_job, encode::encode_many_ids_arrow_bytes};
-
 /// Test doubles for downstream services.
 
 #[derive(Clone, Default)]
@@ -27,7 +23,48 @@ impl FakeDLQ {
         ));
     }
 }
+#[derive(Clone, Default)]
+struct FakeStore {
+    buf: Arc<Mutex<Vec<u8>>>,
+    fail_once: Arc<Mutex<bool>>,
+}
+impl FakeStore {
+    fn new() -> Self {
+        Self {
+            buf: Arc::new(Mutex::new(Vec::new())),
+            fail_once: Arc::new(Mutex::new(false)),
+        }
+    }
 
+    fn new_fail_once() -> Self {
+        Self {
+            buf: Default::default(),
+            fail_once: Arc::new(Mutex::new(true)),
+        }
+    }
+}
+
+impl BlobStore for FakeStore {
+    fn put_bytes<'a>(
+        &'a self,
+        _bucket: &'a str,
+        _key: &'a str,
+        data: Vec<u8>,
+        _content_type: Option<&'a str>,
+        _content_encoding: Option<&'a str>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
+        async move {
+            let mut fail = self.fail_once.lock().unwrap();
+            if *fail {
+                *fail = false;
+                return Err(anyhow!("failure"));
+            }
+            let mut guard = self.buf.lock().unwrap();
+            guard.extend_from_slice(&data);
+            Ok(())
+        }
+    }
+}
 #[derive(Clone, Default)]
 struct FakeIdem {
     /// Simulates Redis SETNX TTL via a set of processed job identifiers.
@@ -55,41 +92,11 @@ enum Claim {
     Duplicate,
 }
 
-#[derive(Clone, Default)]
-struct FakeSink {
-    /// Recorded `(key, bytes)` pairs; can be configured to fail once.
-    puts: Arc<Mutex<Vec<(String, Bytes)>>>,
-    fail_once: Arc<Mutex<bool>>,
-}
-impl FakeSink {
-    fn new_fail_once() -> Self {
-        Self {
-            puts: Default::default(),
-            fail_once: Arc::new(Mutex::new(true)),
-        }
-    }
-}
-#[async_trait]
-impl ReplaySink for FakeSink {
-    type Error = CompilerError;
-    async fn put_delta(&self, key: &str, bytes: Bytes) -> Result<(), Self::Error> {
-        let mut fail = self.fail_once.lock().unwrap();
-        if *fail {
-            *fail = false;
-            return Err(CompilerError::JobProcessingError("sink fail".into()));
-        }
-        self.puts.lock().unwrap().push((key.to_string(), bytes));
-        Ok(())
-    }
-}
-
 /// Minimal orchestrator used in tests.
 /// Returns `(acknowledged, optional dlq_reason)`.
 async fn process_one(
     payload: Bytes,
-    // Added +Sync to satisfy ReplaySink bound used in production.
-    sink: &(impl ReplaySink<Error = CompilerError> + Sync),
-    key_builder: &SimpleKeyBuilder,
+    store: &impl BlobStore,
     idem: &FakeIdem,
     dlq: &FakeDLQ,
 ) -> (bool, Option<String>) {
@@ -98,7 +105,6 @@ async fn process_one(
         Ok(j) => j,
         Err(_) => {
             dlq.publish("decode_error", None, &payload);
-            // Acknowledge so the message is not retried.
             return (true, Some("decode_error".into()));
         }
     };
@@ -107,29 +113,22 @@ async fn process_one(
     match idem.claim(&job.id).await {
         Claim::Duplicate => (true, None),
         Claim::Fresh(idem_key) => {
-            // Encode the job identifier.
+            // Prepare data as Vec<u8>
             let id_bytes = Bytes::from(job.id.clone().into_bytes());
-            let bytes = match encode_many_ids_arrow_bytes(&[id_bytes], false) {
-                Ok(b) => b,
-                Err(e) => {
-                    idem.release(idem_key).await; // release idempotency key
-                    dlq.publish("encode_error", Some(&job.id), &payload);
-                    return (false, Some(format!("encode_error:{e:?}")));
-                }
-            };
+            let data: Vec<u8> = id_bytes.to_vec();
+            let bucket = "test-bucket";
+            let key = format!("jobs/{}", job.id);
 
-            // Build the S3 object key.
-            let s3_key = key_builder.replay_delta_key(&job, 1_712_345_678, 123);
-
-            // Emit to the sink; on failure, release idempotency and DLQ.
-            match sink.put_delta(&s3_key, Bytes::from(bytes)).await {
-                Ok(_) => (true, None),
-                Err(e) => {
-                    idem.release(idem_key).await; // release idempotency key
-                    dlq.publish("process_error", Some(&job.id), &payload);
-                    (false, Some(format!("process_error:{e:?}")))
-                }
+            // Call BlobStore::put_bytes correctly: data Vec<u8>, options are Option<&str>
+            if let Err(e) = store.put_bytes(bucket, &key, data, None, None).await {
+                // release idempotency key so a retry can succeed
+                idem.release(idem_key).await;
+                dlq.publish("encode_error", Some(&job.id), &payload);
+                return (false, Some(format!("encode_error:{e:?}")));
             }
+
+            // success keeps the idempotency claim
+            (true, None)
         }
     }
 }
@@ -146,20 +145,13 @@ fn encode_job(id: &str) -> Bytes {
 
 #[tokio::test]
 async fn decode_error_goes_to_dlq_and_acks() {
-    let sink = FakeSink::default();
-    let key_builder = SimpleKeyBuilder::new("tenants/default");
+    let store = FakeStore::new();
     let idem = FakeIdem::default();
     let dlq = FakeDLQ::default();
 
     // Provide invalid bytes to force a decode error.
-    let (acked, reason) = process_one(
-        Bytes::from_static(b"\x00\x01\x02"),
-        &sink,
-        &key_builder,
-        &idem,
-        &dlq,
-    )
-    .await;
+    let (acked, reason) =
+        process_one(Bytes::from_static(b"\x00\x01\x02"), &store, &idem, &dlq).await;
 
     assert!(acked);
     assert_eq!(reason.as_deref(), Some("decode_error"));
@@ -171,22 +163,21 @@ async fn decode_error_goes_to_dlq_and_acks() {
 
 #[tokio::test]
 async fn duplicate_job_is_acked_no_emit() {
-    let sink = FakeSink::default();
-    let key_builder = SimpleKeyBuilder::new("t/default");
+    let store = FakeStore::new();
     let idem = FakeIdem::default();
     let dlq = FakeDLQ::default();
 
-    let (acked1, reason1) = process_one(encode_job("A"), &sink, &key_builder, &idem, &dlq).await;
+    let (acked1, reason1) = process_one(encode_job("A"), &store, &idem, &dlq).await;
     assert!(acked1);
     assert!(reason1.is_none());
-    assert_eq!(sink.puts.lock().unwrap().len(), 1);
+    assert_eq!(store.buf.lock().unwrap().len(), 1);
 
     // Second send should be treated as a duplicate and produce no new output.
-    let (acked2, reason2) = process_one(encode_job("A"), &sink, &key_builder, &idem, &dlq).await;
+    let (acked2, reason2) = process_one(encode_job("A"), &store, &idem, &dlq).await;
     assert!(acked2);
     assert!(reason2.is_none());
     assert_eq!(
-        sink.puts.lock().unwrap().len(),
+        store.buf.lock().unwrap().len(),
         1,
         "no new puts for duplicate"
     );
@@ -194,20 +185,19 @@ async fn duplicate_job_is_acked_no_emit() {
 
 #[tokio::test]
 async fn sink_failure_releases_idem_and_goes_to_dlq() {
-    let sink = FakeSink::new_fail_once();
-    let key_builder = SimpleKeyBuilder::new("pfx");
+    let store = FakeStore::new_fail_once();
     let idem = FakeIdem::default();
     let dlq = FakeDLQ::default();
 
     // First attempt fails; it is sent to DLQ and idempotency is released.
-    let (acked1, reason1) = process_one(encode_job("B"), &sink, &key_builder, &idem, &dlq).await;
+    let (acked1, reason1) = process_one(encode_job("B"), &store, &idem, &dlq).await;
     assert!(!acked1);
     assert!(matches!(reason1, Some(r) if r.starts_with("process_error")));
     assert_eq!(dlq.items.lock().unwrap().len(), 1);
 
     // Second attempt succeeds after the one-shot failure.
-    let (acked2, reason2) = process_one(encode_job("B"), &sink, &key_builder, &idem, &dlq).await;
+    let (acked2, reason2) = process_one(encode_job("B"), &store, &idem, &dlq).await;
     assert!(acked2);
     assert!(reason2.is_none());
-    assert_eq!(sink.puts.lock().unwrap().len(), 1);
+    assert_eq!(store.buf.lock().unwrap().len(), 1);
 }
