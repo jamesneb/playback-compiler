@@ -21,7 +21,7 @@ struct S3Sink {
     client: Client,
     bucket: String,
 }
-
+#[allow(clippy::manual_async_fn)]
 impl BlobStore for S3Sink {
     fn put_bytes<'a>(
         &'a self,
@@ -40,7 +40,7 @@ impl BlobStore for S3Sink {
                 .send()
                 .await
                 .map(|_| ())
-                .map_err(|e| anyhow::Error::new(e))
+                .map_err(anyhow::Error::new)
         }
     }
 }

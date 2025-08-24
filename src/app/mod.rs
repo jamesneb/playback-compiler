@@ -39,6 +39,9 @@ where
             popped = queue.pop() => {
                 match popped {
                     Ok(Some(msg)) => {
+                        #[cfg(debug_assertions)]
+                        info!(msg_id = %msg.id, payload_len = msg.payload.len(), "received message from queue");
+                        
                         let sem   = semaphore.clone();
                         let store = store.clone();   // cheap handle
                         let cp    = cp.clone();
@@ -47,14 +50,28 @@ where
 
                         join.spawn(async move {
                             let _permit = sem.acquire_owned().await.expect("semaphore");
+                            
+                            #[cfg(debug_assertions)]
+                            info!(msg_id = %msg.id, "processing job");
+                            
                             if let Err(e) = handle_one(msg.payload.to_vec(), &store, &cp, &cfg).await {
-                                error!(error=?e, "job failed");
-                            } else if let Err(e) = q_cl.ack(&msg.id).await {
-                                error!(error=?e, "ack failed");
+                                error!(error=?e, msg_id = %msg.id, "job failed");
+                            } else {
+                                #[cfg(debug_assertions)]
+                                info!(msg_id = %msg.id, "job completed successfully");
+                                
+                                if let Err(e) = q_cl.ack(&msg.id).await {
+                                    error!(error=?e, msg_id = %msg.id, "ack failed");
+                                } else {
+                                    #[cfg(debug_assertions)]
+                                    info!(msg_id = %msg.id, "job acknowledged");
+                                }
                             }
                         });
                     }
-                    Ok(None) => { /* idle poll */ }
+                    Ok(None) => { 
+                        // Only log idle state in debug mode to avoid spam
+                    }
                     Err(e) => {
                         error!(error=?e, "pop failed");
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -84,11 +101,28 @@ async fn handle_one<B: BlobStore>(
     cp: &RedisControlPlane,
     cfg: &Config,
 ) -> Result<(), Box<dyn Error>> {
+    use tracing::error;
+    
     // Decode
     let raw_b = Bytes::from(raw);
+    
+    #[cfg(debug_assertions)]
+    {
+        use tracing::info;
+        info!(payload_len = raw_b.len(), payload_hex = hex::encode(&raw_b), "decoding job payload");
+    }
+    
     let job: Job = match decode_job(&raw_b) {
-        Ok(j) => j,
+        Ok(j) => {
+            #[cfg(debug_assertions)]
+            {
+                use tracing::info;
+                info!(job_id = %j.id, "successfully decoded job");
+            }
+            j
+        },
         Err(e) => {
+            error!(error = %e, payload_hex = hex::encode(&raw_b), "failed to decode job payload");
             let _ = cp.dlq("decode_error", &raw_b).await;
             return Err(e.into());
         }
@@ -115,6 +149,12 @@ async fn handle_one<B: BlobStore>(
     let content_encoding = if use_zstd { Some("zstd") } else { None };
 
     // Upload via injected store (static dispatch)
+    #[cfg(debug_assertions)]
+    {
+        use tracing::info;
+        info!(job_id = %job.id, s3_key = %key, arrow_bytes_len = arrow_bytes.len(), "uploading to S3");
+    }
+    
     store
         .put_bytes(
             &cfg.s3_bucket_name,
@@ -124,8 +164,21 @@ async fn handle_one<B: BlobStore>(
             content_encoding,
         )
         .await?;
+    
+    #[cfg(debug_assertions)]
+    {
+        use tracing::info;
+        info!(job_id = %job.id, s3_key = %key, "successfully uploaded to S3");
+    }
 
     // Release lock
     cp.release(idem_key).await;
+    
+    #[cfg(debug_assertions)]
+    {
+        use tracing::info;
+        info!(job_id = %job.id, "released idempotency lock");
+    }
+    
     Ok(())
 }

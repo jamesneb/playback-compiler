@@ -52,9 +52,9 @@ async fn redis_streams_end_to_end() {
             .await
             .unwrap();
         match val {
-            redis::Value::Bulk(v) => assert!(v.is_empty(), "expected no pending, got {:?}", v),
+            redis::Value::Bulk(v) => assert!(v.is_empty(), "expected no pending, got {v:?}"),
             redis::Value::Int(i) => assert_eq!(i, 0),
-            other => panic!("unexpected XPENDING shape: {:?}", other),
+            other => panic!("unexpected XPENDING shape: {other:?}"),
         }
     }
 }

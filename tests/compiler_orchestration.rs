@@ -7,12 +7,12 @@ use prost::Message;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
-/// Test doubles for downstream services.
-
+/// Tuples of reason, job_id, payload
+type Item = (String, Option<String>, Bytes);
+type Shared<T> = Arc<Mutex<T>>;
 #[derive(Clone, Default)]
 struct FakeDLQ {
-    /// Stored tuples of `(reason, job_id, payload)`.
-    pub items: Arc<Mutex<Vec<(String, Option<String>, Bytes)>>>,
+    pub items: Shared<Vec<Item>>,
 }
 impl FakeDLQ {
     fn publish(&self, reason: &str, job_id: Option<&str>, payload: &Bytes) {
@@ -43,7 +43,7 @@ impl FakeStore {
         }
     }
 }
-
+#[allow(clippy::manual_async_fn)]
 impl BlobStore for FakeStore {
     fn put_bytes<'a>(
         &'a self,

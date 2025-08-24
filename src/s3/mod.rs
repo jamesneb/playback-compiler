@@ -50,11 +50,24 @@ impl BlobStore for S3Client {
 pub async fn create_s3_client_from_env() -> Client {
     dotenvy::dotenv().ok();
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let cfg = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(region))
-        .load()
-        .await;
-    Client::new(&cfg)
+    let mut cfg_builder = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(region));
+    
+    // Configure custom endpoint if specified (for LocalStack, MinIO, etc.)
+    if let Ok(s3_url) = std::env::var("S3_URL") {
+        cfg_builder = cfg_builder.endpoint_url(s3_url);
+    }
+    
+    let cfg = cfg_builder.load().await;
+    let mut s3_config = aws_sdk_s3::config::Builder::from(&cfg);
+    
+    // Use path-style addressing when custom endpoint is specified
+    // This is compatible with both AWS S3 and S3-compatible services
+    if std::env::var("S3_URL").is_ok() {
+        s3_config = s3_config.force_path_style(true);
+    }
+    
+    Client::from_conf(s3_config.build())
 }
 
 /// Upload a single object to S3.

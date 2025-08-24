@@ -92,6 +92,12 @@ impl RedisStreamQueue {
             .await
             .map_err(|e| CompilerError::RedisInit(e.to_string()))?;
 
+        #[cfg(debug_assertions)]
+        {
+            use tracing::debug;
+            debug!(stream = %self.stream, group = %self.group, consumer = %self.consumer, count = count, "executing XREADGROUP");
+        }
+        
         // Request a concrete redis::Value to keep version differences isolated.
         let val: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
@@ -108,7 +114,15 @@ impl RedisStreamQueue {
             .await
             .map_err(|e| CompilerError::RedisPoolError(e.to_string()))?;
 
-        Ok(parse_xread_value(val))
+        let messages = parse_xread_value(val);
+        
+        #[cfg(debug_assertions)]
+        {
+            use tracing::info;
+            info!(message_count = messages.len(), "parsed messages from Redis stream");
+        }
+        
+        Ok(messages)
     }
 
     pub async fn ack_many(&self, ids: &[String]) -> Result<(), CompilerError> {
